@@ -11,8 +11,6 @@ from .models import (
     BlobUpload,
     CheckpointResult,
     MissingResult,
-    ProjectOverviewResult,
-    RetrievalPathsResult,
     RetrievalResult,
     UploadResult,
 )
@@ -133,47 +131,3 @@ class OceHttpClient:
         )
         elapsed = int((time.perf_counter() - started) * 1000)
         return RetrievalResult(str(data.get("formatted_retrieval", "")), elapsed)
-
-    def retrieve_paths(
-        self,
-        query: str,
-        checkpoint_id: str | None,
-        added_blobs: Sequence[str],
-        deleted_blobs: Sequence[str],
-    ) -> RetrievalPathsResult:
-        started = time.perf_counter()
-        data = self._post(
-            "agents/codebase-retrieval-paths",
-            {
-                "information_request": query,
-                "blobs": self._blobs_payload(checkpoint_id, added_blobs, deleted_blobs),
-                "chat_history": [],
-            },
-        )
-        return RetrievalPathsResult(
-            tuple(str(v) for v in data.get("paths", [])),
-            int(data.get("codebase_retrieval_elapsed_ms", (time.perf_counter() - started) * 1000)),
-        )
-
-    def project_overview(
-        self,
-        depth: str,
-        checkpoint_id: str | None,
-        added_blobs: Sequence[str],
-        deleted_blobs: Sequence[str],
-    ) -> ProjectOverviewResult:
-        started = time.perf_counter()
-        data = self._post(
-            "agents/project-overview",
-            {
-                "depth": depth,
-                "blobs": self._blobs_payload(checkpoint_id, added_blobs, deleted_blobs),
-            },
-        )
-        return ProjectOverviewResult(
-            tuple(data.get("key_docs", [])),
-            tuple(data.get("sections", [])),
-            tuple(str(v) for v in data.get("working_set_paths", [])),
-            int(data.get("working_set_paths_total", 0)),
-            int(data.get("codebase_retrieval_elapsed_ms", (time.perf_counter() - started) * 1000)),
-        )

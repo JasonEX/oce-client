@@ -9,8 +9,6 @@ from .models import (
     BlobUpload,
     CheckpointResult,
     MissingResult,
-    ProjectOverviewResult,
-    RetrievalPathsResult,
     RetrievalResult,
     UploadResult,
 )
@@ -43,22 +41,6 @@ class BlobApi(Protocol):
         added_blobs: Sequence[str],
         deleted_blobs: Sequence[str],
     ) -> RetrievalResult: ...
-
-    def retrieve_paths(
-        self,
-        query: str,
-        checkpoint_id: str | None,
-        added_blobs: Sequence[str],
-        deleted_blobs: Sequence[str],
-    ) -> RetrievalPathsResult: ...
-
-    def project_overview(
-        self,
-        depth: str,
-        checkpoint_id: str | None,
-        added_blobs: Sequence[str],
-        deleted_blobs: Sequence[str],
-    ) -> ProjectOverviewResult: ...
 
 
 class StateStore(Protocol):

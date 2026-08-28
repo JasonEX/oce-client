@@ -20,8 +20,6 @@ The CLI is installed as `oce-client`. Global options must precede the command:
 ```text
 oce-client --root <workspace> sync
 oce-client --root <workspace> retrieve "where is authentication implemented?"
-oce-client --root <workspace> paths "where is authentication implemented?"
-oce-client --root <workspace> overview --depth basic
 ```
 
 Use `status` for local state, `observe <path> --content <text>` for an explicit unsaved

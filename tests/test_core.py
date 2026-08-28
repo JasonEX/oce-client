@@ -11,8 +11,6 @@ from oce_client import (
     FileStatus,
     LayeredIgnoreMatcher,
     MissingResult,
-    ProjectOverviewResult,
-    RetrievalPathsResult,
     RetrievalResult,
     Sha256BlobIdentity,
     UploadResult,
@@ -62,12 +60,6 @@ class FakeApi:
 
     def retrieve(self, query, checkpoint_id, added, deleted):
         return RetrievalResult(f"{query}:{checkpoint_id}")
-
-    def retrieve_paths(self, query, checkpoint_id, added, deleted):
-        return RetrievalPathsResult(("src/main.py#L1-2",))
-
-    def project_overview(self, depth, checkpoint_id, added, deleted):
-        return ProjectOverviewResult()
 
 
 def test_hash_matches_oce_contract():

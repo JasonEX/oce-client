@@ -20,16 +20,14 @@ $env:OCE_API_KEY = "sk-opencontextengine"
 $env:OCE_WORKSPACE = (Get-Location).Path
 uv run oce-client sync
 uv run oce-client retrieve "where is request authentication implemented?"
-uv run oce-client paths "where is request authentication implemented?"
-uv run oce-client overview --depth basic
 ```
 
 If unset, `OCE_API_URL` defaults to `http://127.0.0.1:8986` and `OCE_API_KEY`
 defaults to `sk-opencontextengine`. `status` is local-only and does not require
 an API key. `observe` and `remove`
 stage explicit editor changes in SQLite; run `sync` to publish them. Add
-`--json` to `sync`, `status`, `retrieve`, `paths`, `overview`, `observe`, or
-`remove` for machine-readable output. Global options such as `--root` must
+`--json` to `sync`, `status`, `retrieve`, `observe`, or `remove` for
+machine-readable output. Global options such as `--root` must
 appear before the subcommand.
 
 ## MCP

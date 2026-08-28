@@ -17,8 +17,6 @@ from .models import (
     FileRecord,
     FileStatus,
     MissingResult,
-    ProjectOverviewResult,
-    RetrievalPathsResult,
     RetrievalResult,
     SyncResult,
     UploadPlan,

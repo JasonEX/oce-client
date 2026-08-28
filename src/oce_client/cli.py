@@ -116,15 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
     retrieve.add_argument("--scope", choices=("workspace", "working_set"), default="workspace")
     retrieve.add_argument("--json", action="store_true", dest="as_json")
 
-    paths = subparsers.add_parser("paths", help="retrieve ranked paths and line anchors")
-    paths.add_argument("query")
-    paths.add_argument("--scope", choices=("workspace", "working_set"), default="workspace")
-    paths.add_argument("--json", action="store_true", dest="as_json")
-
-    overview = subparsers.add_parser("overview", help="retrieve a project overview")
-    overview.add_argument("--depth", choices=("basic", "deep"), default="basic")
-    overview.add_argument("--json", action="store_true", dest="as_json")
-
     observe = subparsers.add_parser("observe", help="stage explicit file content")
     observe.add_argument("path")
     observe.add_argument("--content", default=None)
@@ -159,7 +150,7 @@ def _settings(args: argparse.Namespace) -> ClientSettings:
         api_key=args.api_key,
         state_path=args.state_path,
         runtime_patterns=iter_runtime_patterns(iter(args.ignore)),
-        require_api_key=args.command in {"sync", "retrieve", "paths", "overview", "watch", "mcp"},
+        require_api_key=args.command in {"sync", "retrieve", "watch", "mcp"},
     )
 
 
@@ -215,20 +206,6 @@ def _run(args: argparse.Namespace) -> int:
                 _dump(result)
             else:
                 print(result.formatted_retrieval)
-            return 0
-        if args.command == "paths":
-            result = context.retrieve_paths(args.query, scope=args.scope)
-            if args.as_json:
-                _dump(result)
-            else:
-                print("\n".join(result.paths))
-            return 0
-        if args.command == "overview":
-            result = context.project_overview(depth=args.depth)
-            if args.as_json:
-                _dump(result)
-            else:
-                print(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2))
             return 0
         if args.command == "observe":
             if args.content is not None and args.content_file is not None:

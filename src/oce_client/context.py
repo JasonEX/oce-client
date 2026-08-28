@@ -14,8 +14,6 @@ from .models import (
     BlobUpload,
     FileRecord,
     FileStatus,
-    ProjectOverviewResult,
-    RetrievalPathsResult,
     RetrievalResult,
     SyncResult,
     UploadPlan,
@@ -347,24 +345,6 @@ class WorkspaceContext:
         snapshot = self.snapshot()
         names = tuple(sorted(record.blob_name for record in snapshot.files.values() if record.status == FileStatus.PRESENT and record.blob_name))
         return self.api.retrieve(query, snapshot.checkpoint_id, names if snapshot.checkpoint_id is None else (), ())
-
-    def retrieve_paths(self, query: str, *, scope: str = "workspace") -> RetrievalPathsResult:
-        if scope not in {"workspace", "working_set"}:
-            raise ValueError(f"unknown scope: {scope}")
-        if self.state.get_meta("synced_generation") != self.state.get_meta("generation"):
-            self.sync()
-        snapshot = self.snapshot()
-        names = tuple(sorted(record.blob_name for record in snapshot.files.values() if record.status == FileStatus.PRESENT and record.blob_name))
-        return self.api.retrieve_paths(query, snapshot.checkpoint_id, names if snapshot.checkpoint_id is None else (), ())
-
-    def project_overview(self, *, depth: str = "basic") -> ProjectOverviewResult:
-        if depth not in {"basic", "deep"}:
-            raise ValueError(f"unknown overview depth: {depth}")
-        if self.state.get_meta("synced_generation") != self.state.get_meta("generation"):
-            self.sync()
-        snapshot = self.snapshot()
-        names = tuple(sorted(record.blob_name for record in snapshot.files.values() if record.status == FileStatus.PRESENT and record.blob_name))
-        return self.api.project_overview(depth, snapshot.checkpoint_id, names if snapshot.checkpoint_id is None else (), ())
 
     def start_watching(self, *, debounce_ms: int = 300) -> WatchHandle:
         if self._watch is not None:

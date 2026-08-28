@@ -88,21 +88,6 @@ class RetrievalResult:
 
 
 @dataclass(frozen=True)
-class RetrievalPathsResult:
-    paths: tuple[str, ...]
-    elapsed_ms: int = 0
-
-
-@dataclass(frozen=True)
-class ProjectOverviewResult:
-    key_docs: tuple[dict[str, object], ...] = ()
-    sections: tuple[dict[str, object], ...] = ()
-    working_set_paths: tuple[str, ...] = ()
-    working_set_paths_total: int = 0
-    elapsed_ms: int = 0
-
-
-@dataclass(frozen=True)
 class SyncResult:
     uploaded_blob_names: tuple[str, ...]
     checkpoint_id: str | None
