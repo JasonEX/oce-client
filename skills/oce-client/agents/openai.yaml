@@ -1,0 +1,4 @@
+interface:
+  display_name: "Oce Client"
+  short_description: "Sync and retrieve workspace code"
+  default_prompt: "Use $oce-client to retrieve the relevant code context for this task."

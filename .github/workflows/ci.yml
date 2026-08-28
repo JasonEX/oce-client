@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --extra dev --extra mcp --locked
+
+      - name: Smoke import
+        run: uv run python -c "import oce_client; from oce_client.mcp_server import create_server; print(oce_client.__version__)"
+
+      - name: Run tests
+        run: uv run pytest -q
+
+  build:
+    name: build (packaging)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Validate bundled skill
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          if len(wheel) != 1:
+              raise SystemExit(f"expected one wheel, found: {wheel}")
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = set(archive.namelist())
+          required = {
+              "oce_client/skill/SKILL.md",
+              "oce_client/skill/agents/openai.yaml",
+          }
+          missing = required - names
+          if missing:
+              raise SystemExit(f"wheel is missing bundled skill files: {sorted(missing)}")
+          PY
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
