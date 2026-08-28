@@ -3,9 +3,19 @@ from __future__ import annotations
 import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
+from collections.abc import Callable
+from typing import Annotated, Any
 
 from .runtime import ClientConfigurationError, ClientRuntime, ClientSettings
+
+
+TOOL_DESCRIPTION = """This tool is Open Context Engine(oce), Open source codebase context engine. It:
+1. Takes in a natural language description of the code you are looking for;
+2. Uses a proprietary retrieval/embedding model suite that produces the highest-quality recall of relevant code snippets from across the codebase;
+3. Maintains a real-time index of the codebase, so the results are always up-to-date and reflects the current state of the codebase;
+4. Can retrieve across different programming languages;
+5. Only reflects the current state of the codebase on the disk, and has no information on version control or code history."""
 
 
 def _require_sdk() -> Any:
@@ -18,61 +28,86 @@ def _require_sdk() -> Any:
     return FastMCP
 
 
-def create_server(settings: ClientSettings) -> Any:
+def create_server(
+    settings: ClientSettings,
+    *,
+    runtime_factory: Callable[[ClientSettings], ClientRuntime] = ClientRuntime,
+) -> Any:
     FastMCP = _require_sdk()
-    runtime = ClientRuntime(settings)
     lock = threading.RLock()
+    runtimes: dict[Path, ClientRuntime] = {}
+
+    def runtime_for(workspace_folder: str | None) -> ClientRuntime:
+        default_root = settings.root.resolve()
+        if workspace_folder is None:
+            root = default_root
+        else:
+            if not workspace_folder.strip():
+                raise ValueError("workspace_folder must not be empty")
+            root = Path(workspace_folder).expanduser().resolve()
+        if root == default_root:
+            runtime_settings = settings
+        else:
+            runtime_settings = ClientSettings(
+                root=root,
+                api_url=settings.api_url,
+                api_key=settings.api_key,
+                runtime_patterns=settings.runtime_patterns,
+            )
+        runtime = runtimes.get(root)
+        if runtime is None:
+            runtime = runtime_factory(runtime_settings)
+            runtimes[root] = runtime
+        return runtime
 
     @asynccontextmanager
     async def lifespan(_server: Any):
         try:
             yield
         finally:
-            runtime.close()
+            for runtime in runtimes.values():
+                runtime.close()
 
     server = FastMCP("oce-client", lifespan=lifespan)
 
-    @server.tool(
-        name="sync_workspace",
-        description="Reconcile local files, upload missing blobs, and advance the workspace checkpoint.",
-    )
-    def sync_workspace() -> dict[str, object]:
+    def codebase_retrieval(
+        information_request: str,
+        workspace_folder: str | None = None,
+    ) -> dict[str, object]:
+        """Retrieve current code context after synchronizing the workspace."""
+        if not information_request.strip():
+            raise ValueError("information_request must not be empty")
         with lock:
-            result = runtime.context().sync()
+            context = runtime_for(workspace_folder or None).context()
+            context.sync()
+            result = context.retrieve(information_request)
         return {
-            "uploaded_blob_names": list(result.uploaded_blob_names),
-            "checkpoint_id": result.checkpoint_id,
-            "added_blobs": list(result.added_blobs),
-            "deleted_blobs": list(result.deleted_blobs),
+            "formatted_retrieval": result.formatted_retrieval,
+            "elapsed_ms": result.elapsed_ms,
         }
 
-    @server.tool(
-        name="retrieve_code",
-        description="Retrieve formatted code context for a natural-language request.",
-    )
-    def retrieve_code(query: str, scope: str = "workspace") -> dict[str, object]:
-        with lock:
-            result = runtime.context().retrieve(query, scope=scope)
-        return {"formatted_retrieval": result.formatted_retrieval, "elapsed_ms": result.elapsed_ms}
+    # FastMCP derives JSON Schema descriptions from Pydantic Field metadata. Keep
+    # pydantic behind the optional MCP extra so the base CLI remains dependency-free.
+    from pydantic import Field
 
-    @server.tool(
-        name="observe_file",
-        description="Stage explicit text for a workspace-relative file before a later sync.",
-    )
-    def observe_file(path: str, content: str) -> dict[str, str]:
-        with lock:
-            runtime.context().observe_file(path, content)
-        return {"path": path, "status": "present"}
-
-    @server.tool(
-        name="remove_file",
-        description="Stage deletion of a workspace-relative file before a later sync.",
-    )
-    def remove_file(path: str) -> dict[str, str]:
-        with lock:
-            runtime.context().remove_file(path)
-        return {"path": path, "status": "deleted"}
-
+    codebase_retrieval.__annotations__ = {
+        "information_request": Annotated[
+            str,
+            Field(description="A description of the information you need."),
+        ],
+        "workspace_folder": Annotated[
+            str,
+            Field(
+                description=(
+                    "Path to the workspace folder to search. Required when multiple "
+                    "workspace folders are open. Use the folder paths shown in your "
+                    "system prompt."
+                )
+            ),
+        ],
+        "return": dict[str, object],
+    }
+    server.tool(name="codebase-retrieval", description=TOOL_DESCRIPTION)(codebase_retrieval)
     return server
 
 

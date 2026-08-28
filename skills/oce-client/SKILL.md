@@ -31,9 +31,11 @@ files until `sync` has completed successfully.
 
 ## MCP
 
-Run `oce-client-mcp` over stdio, or use `oce-client mcp`. The server exposes
-`sync_workspace`, `retrieve_code`, `observe_file`, and `remove_file`. Configure an MCP host with a
-stdio command and pass the same environment variables:
+Run `oce-client-mcp` over stdio, or use `oce-client mcp`. The server exposes one
+tool, `codebase-retrieval`. Each call automatically initializes local state,
+scans and synchronizes the selected workspace, then retrieves current code
+context. Configure an MCP host with a stdio command and pass the same
+environment variables:
 
 ```json
 {
@@ -51,9 +53,10 @@ stdio command and pass the same environment variables:
 ```
 
 When the host cannot expand environment placeholders, configure the secret through its
-secret manager instead of writing the literal key into this file. Use `sync_workspace`
-before retrieval after local changes; retrieval tools automatically sync a stale local
-generation as a convenience, but failures should be surfaced to the user.
+secret manager instead of writing the literal key into this file. Pass
+`information_request` to `codebase-retrieval`; pass `workspace_folder` when the
+host has more than one workspace folder open. Synchronization failures should be
+surfaced to the user.
 
 When this skill is installed from a wheel, `oce-client skill install` copies the
 bundled skill into `$CODEX_HOME/skills/oce-client` (or `$HOME/.codex/skills/oce-client`).

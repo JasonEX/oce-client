@@ -41,11 +41,11 @@ uv sync --extra mcp
 uv run oce-client-mcp
 ```
 
-The server exposes `sync_workspace`, `retrieve_code`, `observe_file`, and
-`remove_file`. It uses
-the same SQLite state and environment variables as the CLI. A Codex-ready skill
-with the host configuration and command guidance is included at
-`skills/oce-client/SKILL.md`.
+The server exposes one tool, `codebase-retrieval`. Each call scans the selected
+workspace, initializes local state when needed, synchronizes changed files, and
+then retrieves current code context. It uses the same SQLite state and
+environment variables as the CLI. A Codex-ready skill with the host
+configuration and command guidance is included at `skills/oce-client/SKILL.md`.
 
 After installing a wheel, locate or install that skill with:
 
