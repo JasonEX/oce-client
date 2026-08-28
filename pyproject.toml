@@ -1,5 +1,5 @@
 [project]
-name = "oce-client"
+name = "opencontextengine-client"
 version = "0.1.0"
 description = "Standalone workspace and blob synchronization client for OpenContextEngine"
 readme = "README.md"

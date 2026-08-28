@@ -1,8 +1,12 @@
-# oce-client
+# opencontextengine-client
 
 Standalone synchronous Python client for OpenContextEngine workspace and blob
 management. The package owns local inventory, ignore rules, upload planning,
 checkpoint state, and retrieval adapters. It does not depend on Auggie SDK.
+
+Install the distribution package with `uv add opencontextengine-client` (or
+`pip install opencontextengine-client`). The installed command remains
+`oce-client`.
 
 ## CLI
 

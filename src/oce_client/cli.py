@@ -26,7 +26,7 @@ from .runtime import (
 
 
 try:
-    VERSION = importlib.metadata.version("oce-client")
+    VERSION = importlib.metadata.version("opencontextengine-client")
 except importlib.metadata.PackageNotFoundError:
     VERSION = "0.1.0"
 

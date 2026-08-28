@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          project_version="$(uv run python -c 'from importlib.metadata import version; print(version("oce-client"))')"
+          project_version="$(uv run python -c 'from importlib.metadata import version; print(version("opencontextengine-client"))')"
           if [[ "${project_version}" != "${tag_version}" ]]; then
             echo "pyproject version ${project_version} does not match tag ${tag_version}"
             exit 1

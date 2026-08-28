@@ -13,7 +13,7 @@ def _require_sdk() -> Any:
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:
         raise ClientConfigurationError(
-            "MCP support is not installed; install oce-client with the 'mcp' extra"
+            "MCP support is not installed; install opencontextengine-client with the 'mcp' extra"
         ) from exc
     return FastMCP
 
