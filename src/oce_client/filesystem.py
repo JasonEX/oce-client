@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 from .ignore import LayeredIgnoreMatcher
@@ -14,8 +15,11 @@ class LocalFileSource:
     def __init__(self, *, max_file_size: int = 1_048_576) -> None:
         self.max_file_size = max_file_size
 
-    def scan(self, root: Path, matcher: LayeredIgnoreMatcher) -> dict[str, str]:
-        files: dict[str, str] = {}
+    def iter_files(
+        self,
+        root: Path,
+        matcher: LayeredIgnoreMatcher,
+    ) -> Iterator[tuple[str, Path, os.stat_result]]:
         root = root.resolve()
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
             directory_path = Path(directory)
@@ -30,20 +34,20 @@ class LocalFileSource:
                 path = directory_path / name
                 try:
                     relative = path.relative_to(root).as_posix()
-                except ValueError:
-                    continue
-                if matcher.ignores(relative):
-                    continue
-                try:
                     stat = path.stat()
-                    if stat.st_size > self.max_file_size:
-                        continue
-                    content = path.read_bytes()
-                    if b"\x00" in content:
-                        continue
-                    files[relative] = content.decode("utf-8", errors="strict")
-                except (OSError, UnicodeDecodeError):
+                except (OSError, ValueError):
                     continue
+                if matcher.ignores(relative) or stat.st_size > self.max_file_size:
+                    continue
+                yield relative, path, stat
+
+    def scan(self, root: Path, matcher: LayeredIgnoreMatcher) -> dict[str, str]:
+        files: dict[str, str] = {}
+        for relative, path, _stat in self.iter_files(root, matcher):
+            try:
+                files[relative] = self.read(path)
+            except (FileAdmissionError, OSError):
+                continue
         return files
 
     def read(self, path: Path) -> str:

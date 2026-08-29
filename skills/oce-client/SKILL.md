@@ -30,20 +30,25 @@ files until `sync` has completed successfully.
 ## MCP
 
 Run `oce-client-mcp` over stdio, or use `oce-client mcp`. The server exposes one
-tool, `codebase-retrieval`. Each call automatically initializes local state,
-scans and synchronizes the selected workspace, then retrieves current code
-context. Configure an MCP host with a stdio command and pass the same
-environment variables:
+tool, `codebase-retrieval`. The MCP process indexes configured workspaces in the
+background and incrementally synchronizes filesystem changes. Configure an MCP
+host with explicit allowed workspaces and pass service credentials through the
+environment:
 
 ```json
 {
   "mcpServers": {
     "oce": {
       "command": "oce-client-mcp",
+      "args": [
+        "--workspace",
+        "/path/to/workspace",
+        "--initial-sync",
+        "background"
+      ],
       "env": {
         "OCE_API_URL": "http://127.0.0.1:8986",
-        "OCE_API_KEY": "${OCE_API_KEY}",
-        "OCE_WORKSPACE": "/path/to/workspace"
+        "OCE_API_KEY": "${OCE_API_KEY}"
       }
     }
   }
@@ -53,8 +58,9 @@ environment variables:
 When the host cannot expand environment placeholders, configure the secret through its
 secret manager instead of writing the literal key into this file. Pass
 `information_request` to `codebase-retrieval`; pass `workspace_folder` when the
-host has more than one workspace folder open. Synchronization failures should be
-surfaced to the user.
+host has more than one configured workspace folder. Treat `status=indexing` as
+a request to retry shortly, surface `status=error` to the user, and use
+retrieval context only when `status=ready`.
 
 When this skill is installed from a wheel, `oce-client skill install` copies the
 bundled skill into `$CODEX_HOME/skills/oce-client` (or `$HOME/.codex/skills/oce-client`).

@@ -90,7 +90,12 @@ class SQLiteStateStore:
                 )
 
     def load_snapshot(self) -> WorkspaceSnapshot:
-        rows = self._conn.execute("SELECT * FROM files ORDER BY path").fetchall()
+        rows = self._conn.execute(
+            "SELECT path, blob_name, committed_blob_name, status, "
+            "CASE WHEN source = 'explicit' THEN content ELSE NULL END AS content, "
+            "size, mtime_ns, source, generation, skip_reason "
+            "FROM files ORDER BY path"
+        ).fetchall()
         files = {
             row["path"]: FileRecord(
             path=row["path"],
@@ -112,7 +117,19 @@ class SQLiteStateStore:
         )
 
     def load_file_rows(self) -> list[sqlite3.Row]:
-        return self._conn.execute("SELECT * FROM files ORDER BY path").fetchall()
+        return self._conn.execute(
+            "SELECT path, blob_name, committed_blob_name, status, size, mtime_ns, "
+            "source, generation, skip_reason FROM files ORDER BY path"
+        ).fetchall()
+
+    def load_file_content(self, path: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT content FROM files WHERE path = ?",
+            (path,),
+        ).fetchone()
+        if row is None or row["content"] is None:
+            return None
+        return str(row["content"])
 
     def upsert_file(self, record: FileRecord, *, committed_blob_name: str | None = None) -> None:
         with self.transaction() as conn:
@@ -149,25 +166,26 @@ class SQLiteStateStore:
                 ),
             )
 
-    def replace_files(self, records: list[FileRecord], generation: int) -> None:
+    def apply_file_changes(
+        self,
+        records: list[FileRecord],
+        deleted_paths: list[str],
+        generation: int,
+    ) -> None:
         with self.transaction() as conn:
-            for record in records:
-                existing = conn.execute(
-                    "SELECT committed_blob_name FROM files WHERE path = ?", (record.path,)
-                ).fetchone()
-                committed = existing["committed_blob_name"] if existing else None
-                conn.execute(
-                    """INSERT INTO files(path, blob_name, committed_blob_name, status, content,
-                       size, mtime_ns, source, generation, skip_reason)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(path) DO UPDATE SET blob_name=excluded.blob_name,
-                       status=excluded.status, content=excluded.content, size=excluded.size,
-                       mtime_ns=excluded.mtime_ns, source=excluded.source,
-                       generation=excluded.generation""",
+            conn.executemany(
+                """INSERT INTO files(path, blob_name, committed_blob_name, status,
+                   content, size, mtime_ns, source, generation, skip_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(path) DO UPDATE SET blob_name=excluded.blob_name,
+                   status=excluded.status, content=excluded.content,
+                   size=excluded.size, mtime_ns=excluded.mtime_ns,
+                   source=excluded.source, generation=excluded.generation""",
+                [
                     (
                         record.path,
                         record.blob_name,
-                        committed,
+                        None,
                         record.status.value,
                         record.content,
                         record.size,
@@ -175,9 +193,24 @@ class SQLiteStateStore:
                         record.source,
                         generation,
                         None,
-                    ),
+                    )
+                    for record in records
+                ],
+            )
+            if deleted_paths:
+                conn.executemany(
+                    "UPDATE files SET status = ?, blob_name = NULL, content = NULL, "
+                    "source = 'filesystem', generation = ? WHERE path = ?",
+                    [
+                        (FileStatus.DELETED.value, generation, path)
+                        for path in deleted_paths
+                    ],
                 )
-            conn.execute("INSERT INTO meta(key,value) VALUES('generation',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(generation),))
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('generation',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(generation),),
+            )
 
     def mark_missing_paths(self, paths: list[str], generation: int) -> None:
         if not paths:
@@ -207,6 +240,7 @@ class SQLiteStateStore:
     ) -> None:
         with self.transaction() as conn:
             conn.execute("UPDATE files SET committed_blob_name = blob_name WHERE status = 'present'")
+            conn.execute("UPDATE files SET content = NULL WHERE source = 'filesystem'")
             if deleted_paths:
                 conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in deleted_paths])
             conn.execute(

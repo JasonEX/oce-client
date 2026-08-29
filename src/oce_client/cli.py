@@ -130,6 +130,34 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--debounce-ms", type=int, default=300)
 
     mcp = subparsers.add_parser("mcp", help="run the MCP server over stdio")
+    mcp.add_argument(
+        "--workspace",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="allowed workspace folder; repeat for multiple workspaces",
+    )
+    mcp.add_argument("--state-dir", default=os.environ.get("OCE_STATE_DIR"))
+    mcp.add_argument(
+        "--debounce-ms",
+        type=int,
+        default=os.environ.get("OCE_DEBOUNCE_MS", "500"),
+    )
+    mcp.add_argument(
+        "--initial-sync",
+        choices=("background", "blocking", "off"),
+        default=os.environ.get("OCE_INITIAL_SYNC", "background"),
+    )
+    mcp.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=os.environ.get("OCE_READY_TIMEOUT", "3"),
+    )
+    mcp.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error", "critical"),
+        default=os.environ.get("OCE_LOG_LEVEL", "warning").lower(),
+    )
     mcp.set_defaults(command="mcp")
 
     skill = subparsers.add_parser("skill", help="locate or install the Codex skill")
@@ -144,8 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _settings(args: argparse.Namespace) -> ClientSettings:
+    root = args.root
+    if args.command == "mcp" and args.workspace:
+        root = args.workspace[0]
     return ClientSettings.from_environment(
-        root=args.root,
+        root=root,
         api_url=args.api_url,
         api_key=args.api_key,
         state_path=args.state_path,
@@ -180,7 +211,20 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     settings = _settings(args)
     if args.command == "mcp":
-        run_mcp(settings)
+        roots = tuple(Path(value).expanduser().resolve() for value in args.workspace)
+        if len(roots) > 1 and settings.state_path is not None and args.state_dir is None:
+            raise ClientConfigurationError(
+                "--state-path cannot be shared by multiple workspaces; use --state-dir"
+            )
+        run_mcp(
+            settings,
+            workspace_roots=roots or None,
+            state_dir=Path(args.state_dir) if args.state_dir else None,
+            debounce_ms=args.debounce_ms,
+            initial_sync=args.initial_sync,
+            ready_timeout=args.ready_timeout,
+            log_level=args.log_level.upper(),
+        )
         return 0
     with ClientRuntime(settings) as runtime:
         context = runtime.context()

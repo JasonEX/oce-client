@@ -36,14 +36,42 @@ Install the optional MCP extra and expose the stdio server to an MCP host:
 
 ```powershell
 uv sync --extra mcp
-uv run oce-client-mcp
+uv run oce-client-mcp --workspace C:\path\to\workspace
 ```
 
-The server exposes one tool, `codebase-retrieval`. Each call scans the selected
-workspace, initializes local state when needed, synchronizes changed files, and
-then retrieves current code context. It uses the same SQLite state and
-environment variables as the CLI. A Codex-ready skill with the host
-configuration and command guidance is included at `skills/oce-client/SKILL.md`.
+The server exposes one tool, `codebase-retrieval`. Workspace indexing belongs
+to the MCP process rather than the coding agent: the server starts the initial
+index in the background, watches the filesystem, and synchronizes only changed
+paths. Unchanged files are identified by stored filesystem metadata and are not
+read or rehashed on restart.
+
+Declare each allowed workspace with a repeated `--workspace` argument. With one
+workspace, the tool's `workspace_folder` input is optional. With multiple
+workspaces it is required and must exactly match an allowed path. Other paths
+are rejected.
+
+```powershell
+oce-client-mcp `
+  --workspace C:\src\project-a `
+  --workspace C:\src\project-b `
+  --state-dir $env:LOCALAPPDATA\oce-client `
+  --initial-sync background `
+  --debounce-ms 500 `
+  --ready-timeout 3
+```
+
+`--initial-sync` accepts `background` (default), `blocking`, or `off`; `off`
+defers initialization until the first retrieval call. A tool call waits up to
+`--ready-timeout` seconds for the latest observed filesystem generation. Its
+result status is `ready`, `indexing`, or `error`; only a `ready` result contains
+retrieval context. `OCE_API_URL`, `OCE_API_KEY`, `OCE_STATE_DIR`,
+`OCE_DEBOUNCE_MS`, `OCE_INITIAL_SYNC`, `OCE_READY_TIMEOUT`, and `OCE_LOG_LEVEL`
+provide environment equivalents. Keep the API key in the environment rather
+than command arguments.
+
+The server uses the same SQLite state and environment variables as the CLI. A
+Codex-ready skill with the host configuration and command guidance is included
+at `skills/oce-client/SKILL.md`.
 
 After installing a wheel, locate or install that skill with:
 

@@ -153,7 +153,6 @@ class WorkspaceContext:
 
     def reconcile(self) -> WorkspaceSnapshot:
         generation = self._next_generation()
-        scanned = self.file_source.scan(self.root, self._matcher())
         current = self.state.load_snapshot()
         explicit = {
             path: record
@@ -161,66 +160,170 @@ class WorkspaceContext:
             if record.source == "explicit" and record.status == FileStatus.PRESENT
         }
         records: list[FileRecord] = []
-        for path, content in scanned.items():
-            overlay = explicit.get(path)
-            if overlay is not None:
-                disk_blob_name = self.identity.calculate(path, content)
-                if disk_blob_name != overlay.blob_name:
-                    records.append(overlay)
-                    continue
-            stat_path = self.root / Path(path)
+        known_paths: set[str] = set()
+        scanned_paths: set[str] = set()
+        matcher = self._matcher()
+
+        def flush_records() -> None:
+            if records:
+                self.state.apply_file_changes(records, [], generation)
+                records.clear()
+
+        for path, source_path, stat in self.file_source.iter_files(self.root, matcher):
+            scanned_paths.add(path)
+            known_paths.add(path)
+            existing = current.files.get(path)
+            if (
+                existing is not None
+                and existing.source == "filesystem"
+                and existing.status == FileStatus.PRESENT
+                and existing.blob_name
+                and existing.mtime_ns == stat.st_mtime_ns
+                and existing.size == stat.st_size
+            ):
+                records.append(
+                    FileRecord(
+                        path,
+                        existing.blob_name,
+                        FileStatus.PRESENT,
+                        None,
+                        existing.size,
+                        existing.mtime_ns,
+                        "filesystem",
+                        generation,
+                    )
+                )
+                if len(records) >= 256:
+                    flush_records()
+                continue
             try:
-                mtime_ns = stat_path.stat().st_mtime_ns
-            except OSError:
-                mtime_ns = None
+                content = self.file_source.read(source_path)
+                stat = source_path.stat()
+            except (FileAdmissionError, OSError):
+                continue
+            blob_name = self.identity.calculate(path, content)
+            overlay = explicit.get(path)
+            if overlay is not None and blob_name != overlay.blob_name:
+                records.append(overlay)
+                if len(records) >= 256:
+                    flush_records()
+                continue
             records.append(
                 FileRecord(
                     path,
-                    self.identity.calculate(path, content),
+                    blob_name,
                     FileStatus.PRESENT,
                     content,
-                    len(content.encode("utf-8")),
-                    mtime_ns,
+                    stat.st_size,
+                    stat.st_mtime_ns,
                     "filesystem",
                     generation,
                 )
             )
-        scanned_paths = set(scanned)
+            if len(records) >= 256:
+                flush_records()
         for path, record in explicit.items():
             if path not in scanned_paths:
                 records.append(record)
-        self.state.replace_files(records, generation)
-        known_paths = {record.path for record in records}
+                known_paths.add(path)
+                if len(records) >= 256:
+                    flush_records()
+        flush_records()
+        self.state.set_meta("generation", str(generation))
         missing_paths = [path for path in current.files if path not in known_paths and path not in explicit]
         self.state.mark_missing_paths(missing_paths, generation)
+        return self.state.load_snapshot()
+
+    def reconcile_paths(self, changed_paths: Iterable[str | os.PathLike[str]]) -> WorkspaceSnapshot:
+        resolved_paths: set[Path] = set()
+        for path in changed_paths:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = self.root / candidate
+            resolved_paths.add(candidate.resolve())
+        if not resolved_paths:
+            return self.snapshot()
+        for path in resolved_paths:
+            if path.name in {".gitignore", ".oceignore"} or path.is_dir():
+                return self.reconcile()
+
+        generation = self._next_generation()
+        current = self.state.load_snapshot()
+        matcher = self._matcher()
+        records: list[FileRecord] = []
+        deleted: set[str] = set()
+        for source_path in resolved_paths:
+            try:
+                relative = source_path.relative_to(self.root).as_posix()
+            except ValueError:
+                continue
+            tracked = {
+                path
+                for path in current.files
+                if path == relative or path.startswith(relative.rstrip("/") + "/")
+            }
+            if not source_path.is_file() or matcher.ignores(relative):
+                deleted.update(
+                    path
+                    for path in tracked
+                    if current.files[path].source != "explicit"
+                )
+                continue
+            try:
+                stat = source_path.stat()
+                if stat.st_size > self.file_source.max_file_size:
+                    deleted.update(tracked)
+                    continue
+                content = self.file_source.read(source_path)
+                stat = source_path.stat()
+            except (FileAdmissionError, OSError):
+                deleted.update(tracked)
+                continue
+            blob_name = self.identity.calculate(relative, content)
+            existing = current.files.get(relative)
+            if (
+                existing is not None
+                and existing.source == "explicit"
+                and existing.status == FileStatus.PRESENT
+                and existing.blob_name != blob_name
+            ):
+                records.append(existing)
+                continue
+            records.append(
+                FileRecord(
+                    relative,
+                    blob_name,
+                    FileStatus.PRESENT,
+                    content,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    "filesystem",
+                    generation,
+                )
+            )
+            deleted.discard(relative)
+        self.state.apply_file_changes(records, sorted(deleted), generation)
         return self.state.load_snapshot()
 
     def snapshot(self) -> WorkspaceSnapshot:
         return self.state.load_snapshot()
 
     def plan_sync(self) -> UploadPlan:
-        snapshot = self.state.load_snapshot()
-        uploads: list[BlobUpload] = []
         current_names: set[str] = set()
         committed_names: set[str] = set()
         skipped: list[str] = []
-        for record in snapshot.files.values():
-            if record.status == FileStatus.PRESENT and record.blob_name:
-                current_names.add(record.blob_name)
-                if record.content is not None:
-                    uploads.append(BlobUpload(record.path, record.content, record.blob_name))
-            elif record.status == FileStatus.SKIPPED:
-                skipped.append(record.path)
-            if record.status != FileStatus.PRESENT and record.committed_blob_name:
-                committed_names.add(record.committed_blob_name)
         for row in self.state.load_file_rows():
+            if row["status"] == FileStatus.PRESENT.value and row["blob_name"]:
+                current_names.add(str(row["blob_name"]))
+            elif row["status"] == FileStatus.SKIPPED.value:
+                skipped.append(str(row["path"]))
             if row["committed_blob_name"]:
                 committed_names.add(str(row["committed_blob_name"]))
         added = tuple(sorted(current_names - committed_names))
         deleted = tuple(sorted(committed_names - current_names))
         return UploadPlan(
-            tuple(uploads),
-            BlobDelta(snapshot.checkpoint_id, added, deleted),
+            (),
+            BlobDelta(self.state.get_meta("checkpoint_id"), added, deleted),
             tuple(sorted(skipped)),
         )
 
@@ -243,6 +346,16 @@ class WorkspaceContext:
 
     def sync(self) -> SyncResult:
         self.reconcile()
+        return self._sync_reconciled()
+
+    def sync_paths(
+        self,
+        changed_paths: Iterable[str | os.PathLike[str]],
+    ) -> SyncResult:
+        self.reconcile_paths(changed_paths)
+        return self._sync_reconciled()
+
+    def _sync_reconciled(self) -> SyncResult:
         plan = self.plan_sync()
         payload = {
             "delta": plan.delta.to_api_dict(),
@@ -256,30 +369,42 @@ class WorkspaceContext:
         self.state.supersede_pending()
         operation_id = self.state.add_outbox("sync", payload)
         try:
-            current_names = tuple(
-                sorted(
-                    record.blob_name
-                    for record in self.snapshot().files.values()
-                    if record.status == FileStatus.PRESENT and record.blob_name
-                )
+            rows = self.state.load_file_rows()
+            current_records = {
+                str(row["blob_name"]): row
+                for row in rows
+                if row["status"] == FileStatus.PRESENT.value and row["blob_name"]
+            }
+            current_names = tuple(sorted(current_records))
+            names_to_check = (
+                current_names
+                if plan.delta.checkpoint_id is None
+                else plan.delta.added_blobs
             )
             unknown: set[str] = set()
             nonindexed: set[str] = set()
-            for offset in range(0, len(current_names), self.max_find_missing):
+            for offset in range(0, len(names_to_check), self.max_find_missing):
                 missing = self.api.find_missing(
-                    current_names[offset : offset + self.max_find_missing]
+                    names_to_check[offset : offset + self.max_find_missing]
                 )
                 unknown.update(missing.unknown_blob_names)
                 nonindexed.update(missing.nonindexed_blob_names)
             to_upload = unknown | nonindexed
-            upload_by_name = {upload.blob_name: upload for upload in plan.uploads}
-            actual_uploads = [
-                upload_by_name[name] for name in sorted(to_upload) if name in upload_by_name
-            ]
             uploaded_names: set[str] = set()
             batch: list[BlobUpload] = []
             batch_bytes = 0
-            for upload in actual_uploads:
+            for name in sorted(to_upload):
+                record = current_records.get(name)
+                if record is None:
+                    raise BlobCompatibilityError(f"missing local record for blob {name}")
+                path = str(record["path"])
+                content = self.state.load_file_content(path)
+                if content is None:
+                    content = self.file_source.read(self.root / Path(path))
+                actual_name = self.identity.calculate(path, content)
+                if actual_name != name:
+                    raise BlobCompatibilityError(f"file changed during sync: {path}")
+                upload = BlobUpload(path, content, name)
                 upload_bytes = len(upload.path.encode("utf-8")) + len(upload.content.encode("utf-8"))
                 if batch and (
                     len(batch) >= self.max_upload_blobs
@@ -349,5 +474,5 @@ class WorkspaceContext:
     def start_watching(self, *, debounce_ms: int = 300) -> WatchHandle:
         if self._watch is not None:
             return self._watch
-        self._watch = WatchHandle(self.root, self.sync, debounce_ms)
+        self._watch = WatchHandle(self.root, self.sync_paths, debounce_ms)
         return self._watch

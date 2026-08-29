@@ -7,8 +7,20 @@ from pathlib import Path
 from watchfiles import Change, watch
 
 
+_INTERNAL_DIRECTORIES = {".git", ".oce-client"}
+
+
+def _is_relevant(path: str) -> bool:
+    return _INTERNAL_DIRECTORIES.isdisjoint(Path(path).parts)
+
+
 class WatchHandle:
-    def __init__(self, root: Path, callback: Callable[[], None], debounce_ms: int = 300) -> None:
+    def __init__(
+        self,
+        root: Path,
+        callback: Callable[[set[Path]], None],
+        debounce_ms: int = 300,
+    ) -> None:
         self._root = root
         self._callback = callback
         self._debounce_ms = debounce_ms
@@ -30,10 +42,10 @@ class WatchHandle:
                 relevant = {
                     Path(path)
                     for _change, path in batch
-                    if ".oce-client" not in Path(path).parts
+                    if _is_relevant(path)
                 }
                 if relevant:
-                    self._callback()
+                    self._callback(relevant)
         except (OSError, RuntimeError):
             # The owning context remains usable; a later explicit reconcile can recover.
             return

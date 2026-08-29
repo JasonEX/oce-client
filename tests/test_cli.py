@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from oce_client.cli import main
+from oce_client.cli import build_parser, main
 from oce_client.runtime import DEFAULT_API_KEY, DEFAULT_API_URL, ClientSettings
 
 
@@ -43,6 +43,31 @@ def test_environment_values_are_used(tmp_path: Path, monkeypatch, capsys):
     assert main(["status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["generation"] == 0
+
+
+def test_mcp_runtime_options_are_available_from_unified_cli(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "mcp",
+            "--workspace",
+            str(tmp_path),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--debounce-ms",
+            "250",
+            "--initial-sync",
+            "off",
+            "--ready-timeout",
+            "1.5",
+            "--log-level",
+            "error",
+        ]
+    )
+    assert args.workspace == [str(tmp_path)]
+    assert args.debounce_ms == 250
+    assert args.initial_sync == "off"
+    assert args.ready_timeout == 1.5
+    assert args.log_level == "error"
 
 
 def test_skill_can_be_located_and_installed(tmp_path: Path, capsys):

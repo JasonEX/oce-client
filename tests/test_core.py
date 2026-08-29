@@ -10,6 +10,7 @@ from oce_client import (
     CheckpointResult,
     FileStatus,
     LayeredIgnoreMatcher,
+    LocalFileSource,
     MissingResult,
     RetrievalResult,
     Sha256BlobIdentity,
@@ -62,6 +63,16 @@ class FakeApi:
         return RetrievalResult(f"{query}:{checkpoint_id}")
 
 
+class CountingFileSource(LocalFileSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_paths: list[Path] = []
+
+    def read(self, path: Path) -> str:
+        self.read_paths.append(path)
+        return super().read(path)
+
+
 def test_hash_matches_oce_contract():
     assert Sha256BlobIdentity().calculate("src/main.py", "print(1)") == (
         "69077264fad0c3c3321a9a1c36b0595f6c8c362e1d9529ac6f17431c753edfff"
@@ -96,6 +107,50 @@ def test_sync_add_modify_delete_and_restore(tmp_path: Path):
         assert second.added_blobs[0] in third.deleted_blobs
     finally:
         context.close()
+
+
+def test_incremental_sync_does_not_reread_unchanged_files(tmp_path: Path):
+    first_path = tmp_path / "first.py"
+    second_path = tmp_path / "second.py"
+    first_path.write_text("one", encoding="utf-8")
+    second_path.write_text("two", encoding="utf-8")
+    source = CountingFileSource()
+    api = FakeApi()
+    context = WorkspaceContext.open(
+        tmp_path,
+        api,
+        file_source=source,
+        ready_poll_attempts=1,
+    )
+    try:
+        context.sync()
+        assert len(source.read_paths) == 2
+        assert all(
+            record.content is None for record in context.snapshot().files.values()
+        )
+
+        context.sync()
+        assert len(source.read_paths) == 2
+
+        first_path.write_text("one changed", encoding="utf-8")
+        context.sync_paths({"first.py"})
+        assert source.read_paths[-1] == first_path
+        assert source.read_paths.count(second_path) == 1
+    finally:
+        context.close()
+
+    restarted_source = CountingFileSource()
+    restarted = WorkspaceContext.open(
+        tmp_path,
+        api,
+        file_source=restarted_source,
+        ready_poll_attempts=1,
+    )
+    try:
+        restarted.sync()
+        assert restarted_source.read_paths == []
+    finally:
+        restarted.close()
 
 
 def test_upload_failure_does_not_advance_checkpoint(tmp_path: Path):
