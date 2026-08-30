@@ -5,22 +5,18 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-30
+
 ### Added
 
-- Add per-workspace background indexing, incremental filesystem synchronization,
-  workspace allowlists, and MCP runtime configuration.
+- **mcp**: add background incremental indexing
+- **mcp**: expose unified codebase retrieval tool
+- initialize oce-client
 
 ### Changed
 
-- Make code retrieval wait for the latest observed index generation and return
-  explicit `ready`, `indexing`, or `error` status.
-- Unify CLI and standalone MCP configuration loading with explicit workspace
-  selection, documented argument/environment precedence, and environment-only
-  API key loading.
-- Clarify the CLI-only Agent Skill, including command reference, retrieval
-  workflows, and synchronization requirements.
-
-### Removed
-
-- Remove unsupported project overview and retrieval-paths service endpoints.
-- Remove the redundant `oce-client mcp` CLI subcommand; use `oce-client-mcp`.
+- **skill**: keep interface guidance CLI-only
+- **skill**: clarify CLI agent workflow
+- **cli**: keep MCP as standalone entry point
+- **config**: unify cli and mcp settings
+- **client**: remove unsupported retrieval endpoints
