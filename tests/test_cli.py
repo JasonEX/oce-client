@@ -33,16 +33,21 @@ def test_default_service_settings(monkeypatch, tmp_path: Path):
     assert settings.api_key == DEFAULT_API_KEY
 
 
-def test_explicit_empty_api_key_is_rejected(tmp_path: Path, capsys):
-    assert main(["--root", str(tmp_path), "--api-key", "", "sync"]) == 1
+def test_empty_environment_api_key_is_rejected(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("OCE_API_KEY", "")
+    assert main(["--root", str(tmp_path), "sync"]) == 1
     assert "OCE API key is required" in capsys.readouterr().err
 
 
 def test_environment_values_are_used(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setenv("OCE_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("OCE_IGNORE", "*.generated.py, *.cache")
     assert main(["status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["generation"] == 0
+
+    settings = ClientSettings.from_environment()
+    assert settings.runtime_patterns == ("*.generated.py", "*.cache")
 
 
 def test_mcp_runtime_options_are_available_from_unified_cli(tmp_path: Path):

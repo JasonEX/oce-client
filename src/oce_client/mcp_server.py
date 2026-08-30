@@ -15,6 +15,7 @@ from .runtime import (
     ClientConfigurationError,
     ClientRuntime,
     ClientSettings,
+    McpConfiguration,
     iter_runtime_patterns,
 )
 
@@ -37,10 +38,82 @@ def _require_sdk() -> Any:
     return FastMCP
 
 
-def _state_path(state_dir: Path, root: Path) -> Path:
-    identity = os.path.normcase(str(root.resolve())).encode("utf-8")
-    name = hashlib.sha256(identity).hexdigest()[:16]
-    return state_dir.expanduser().resolve() / f"{name}.sqlite3"
+def add_mcp_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the exact MCP launch options to either supported entry point."""
+    parser.add_argument(
+        "--workspace",
+        action="append",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="allowed workspace folder; repeat for multiple workspaces",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=argparse.SUPPRESS,
+        help="OCE API URL (default: OCE_API_URL or the local default)",
+    )
+    parser.add_argument(
+        "--state-path",
+        default=argparse.SUPPRESS,
+        help="SQLite state file; only valid with one workspace",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=argparse.SUPPRESS,
+        help="directory for per-workspace SQLite state (OCE_STATE_DIR)",
+    )
+    parser.add_argument(
+        "--ignore",
+        action="append",
+        default=argparse.SUPPRESS,
+        metavar="PATTERN",
+        help="runtime ignore pattern; repeat or comma-separate (OCE_IGNORE)",
+    )
+    parser.add_argument(
+        "--debounce-ms",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="filesystem watcher debounce interval",
+    )
+    parser.add_argument(
+        "--initial-sync",
+        choices=("background", "blocking", "off"),
+        default=argparse.SUPPRESS,
+        help="initial workspace synchronization strategy",
+    )
+    parser.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="seconds a retrieval waits for the latest index generation",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("debug", "info", "warning", "error", "critical"),
+        default=argparse.SUPPRESS,
+        help="MCP server log level",
+    )
+
+
+def mcp_configuration_from_args(args: argparse.Namespace) -> McpConfiguration:
+    values = getattr(args, "workspace", None)
+    if not values and getattr(args, "root", None):
+        values = (args.root,)
+    return McpConfiguration.from_environment(
+        workspace_roots=tuple(values) if values else None,
+        api_url=getattr(args, "api_url", None),
+        state_path=getattr(args, "state_path", None),
+        state_dir=getattr(args, "state_dir", None),
+        runtime_patterns=(
+            iter_runtime_patterns(args.ignore)
+            if getattr(args, "ignore", None) is not None
+            else None
+        ),
+        debounce_ms=getattr(args, "debounce_ms", None),
+        initial_sync=getattr(args, "initial_sync", None),
+        ready_timeout=getattr(args, "ready_timeout", None),
+        log_level=getattr(args, "log_level", None),
+    )
 
 
 def create_server(
@@ -132,7 +205,7 @@ def create_server(
             for indexer in indexers.values():
                 indexer.stop()
 
-    server = FastMCP("oce-client", lifespan=lifespan, log_level=log_level)
+    server = FastMCP("oce-client", lifespan=lifespan, log_level=log_level.upper())
 
     async def codebase_retrieval(
         information_request: str,
@@ -175,6 +248,12 @@ def create_server(
     return server
 
 
+def _state_path(state_dir: Path, root: Path) -> Path:
+    identity = os.path.normcase(str(root.resolve())).encode("utf-8")
+    name = hashlib.sha256(identity).hexdigest()[:16]
+    return state_dir.expanduser().resolve() / f"{name}.sqlite3"
+
+
 def run_mcp(
     settings: ClientSettings,
     *,
@@ -197,81 +276,31 @@ def run_mcp(
     server.run(transport="stdio")
 
 
+def run_mcp_configuration(configuration: McpConfiguration) -> None:
+    run_mcp(
+        configuration.client,
+        workspace_roots=configuration.workspace_roots,
+        state_dir=configuration.state_dir,
+        debounce_ms=configuration.debounce_ms,
+        initial_sync=configuration.initial_sync,
+        ready_timeout=configuration.ready_timeout,
+        log_level=configuration.log_level,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="oce-client-mcp",
         description="Run the OpenContextEngine MCP server over stdio.",
     )
-    parser.add_argument(
-        "--workspace",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help="allowed workspace folder; repeat for multiple workspaces",
-    )
-    parser.add_argument("--api-url", default=None, help="OCE API URL")
-    parser.add_argument(
-        "--state-dir",
-        default=os.environ.get("OCE_STATE_DIR"),
-        help="directory for per-workspace SQLite state",
-    )
-    parser.add_argument(
-        "--ignore",
-        action="append",
-        default=[],
-        metavar="PATTERN",
-        help="runtime ignore pattern; repeat or comma-separate",
-    )
-    parser.add_argument(
-        "--debounce-ms",
-        type=int,
-        default=os.environ.get("OCE_DEBOUNCE_MS", "500"),
-        help="filesystem watcher debounce interval",
-    )
-    parser.add_argument(
-        "--initial-sync",
-        choices=("background", "blocking", "off"),
-        default=os.environ.get("OCE_INITIAL_SYNC", "background"),
-        help="initial workspace synchronization strategy",
-    )
-    parser.add_argument(
-        "--ready-timeout",
-        type=float,
-        default=os.environ.get("OCE_READY_TIMEOUT", "3"),
-        help="seconds a retrieval waits for the latest index generation",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=("debug", "info", "warning", "error", "critical"),
-        default=os.environ.get("OCE_LOG_LEVEL", "warning").lower(),
-    )
+    add_mcp_arguments(parser)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        roots = tuple(Path(value).expanduser().resolve() for value in args.workspace)
-        root = roots[0] if roots else None
-        settings = ClientSettings.from_environment(
-            root=root,
-            api_url=args.api_url,
-            runtime_patterns=iter_runtime_patterns(iter(args.ignore)),
-            require_api_key=True,
-        )
-        if len(roots) > 1 and settings.state_path is not None and args.state_dir is None:
-            raise ClientConfigurationError(
-                "OCE_STATE_PATH cannot be shared by multiple workspaces; use --state-dir"
-            )
-        run_mcp(
-            settings,
-            workspace_roots=roots or None,
-            state_dir=Path(args.state_dir) if args.state_dir else None,
-            debounce_ms=args.debounce_ms,
-            initial_sync=args.initial_sync,
-            ready_timeout=args.ready_timeout,
-            log_level=args.log_level.upper(),
-        )
+        run_mcp_configuration(mcp_configuration_from_args(args))
     except (ClientConfigurationError, OSError, ValueError) as exc:
         print(f"oce-client-mcp: {exc}", file=sys.stderr)
         return 1

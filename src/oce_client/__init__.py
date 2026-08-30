@@ -24,5 +24,10 @@ from .models import (
     WorkspaceSnapshot,
 )
 from .ports import BlobApi, BlobIdentity, FileSource, IgnoreMatcher, StateStore, Watcher
-from .runtime import ClientConfigurationError, ClientRuntime, ClientSettings
+from .runtime import (
+    ClientConfigurationError,
+    ClientRuntime,
+    ClientSettings,
+    McpConfiguration,
+)
 from .state import SQLiteStateStore

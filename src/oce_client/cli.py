@@ -15,7 +15,7 @@ from typing import Sequence
 from .context import BlobCompatibilityError, CheckpointResetRequired
 from .filesystem import FileAdmissionError
 from .http import OceApiError
-from .mcp_server import run_mcp
+from .mcp_server import add_mcp_arguments, mcp_configuration_from_args, run_mcp_configuration
 from .runtime import (
     DEFAULT_API_URL,
     ClientConfigurationError,
@@ -91,17 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"OCE API URL (default: OCE_API_URL or {DEFAULT_API_URL})",
     )
     parser.add_argument(
-        "--api-key",
+        "--state-path",
         default=None,
-        help="OCE bearer key (default: OCE_API_KEY or the built-in local key)",
+        help="SQLite state path (default: OCE_STATE_PATH or workspace/.oce-client)",
     )
-    parser.add_argument("--state-path", default=None, help="SQLite state path")
     parser.add_argument(
         "--ignore",
         action="append",
-        default=[],
+        default=None,
         metavar="PATTERN",
-        help="runtime ignore pattern; can be repeated or comma-separated",
+        help="runtime ignore pattern; can be repeated or comma-separated (OCE_IGNORE)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -130,34 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--debounce-ms", type=int, default=300)
 
     mcp = subparsers.add_parser("mcp", help="run the MCP server over stdio")
-    mcp.add_argument(
-        "--workspace",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help="allowed workspace folder; repeat for multiple workspaces",
-    )
-    mcp.add_argument("--state-dir", default=os.environ.get("OCE_STATE_DIR"))
-    mcp.add_argument(
-        "--debounce-ms",
-        type=int,
-        default=os.environ.get("OCE_DEBOUNCE_MS", "500"),
-    )
-    mcp.add_argument(
-        "--initial-sync",
-        choices=("background", "blocking", "off"),
-        default=os.environ.get("OCE_INITIAL_SYNC", "background"),
-    )
-    mcp.add_argument(
-        "--ready-timeout",
-        type=float,
-        default=os.environ.get("OCE_READY_TIMEOUT", "3"),
-    )
-    mcp.add_argument(
-        "--log-level",
-        choices=("debug", "info", "warning", "error", "critical"),
-        default=os.environ.get("OCE_LOG_LEVEL", "warning").lower(),
-    )
+    add_mcp_arguments(mcp)
     mcp.set_defaults(command="mcp")
 
     skill = subparsers.add_parser("skill", help="locate or install the Codex skill")
@@ -178,9 +150,10 @@ def _settings(args: argparse.Namespace) -> ClientSettings:
     return ClientSettings.from_environment(
         root=root,
         api_url=args.api_url,
-        api_key=args.api_key,
         state_path=args.state_path,
-        runtime_patterns=iter_runtime_patterns(iter(args.ignore)),
+        runtime_patterns=(
+            iter_runtime_patterns(iter(args.ignore)) if args.ignore else None
+        ),
         require_api_key=args.command in {"sync", "retrieve", "watch", "mcp"},
     )
 
@@ -209,23 +182,10 @@ def _run(args: argparse.Namespace) -> int:
         else:
             print(f"installed skill at {target}")
         return 0
-    settings = _settings(args)
     if args.command == "mcp":
-        roots = tuple(Path(value).expanduser().resolve() for value in args.workspace)
-        if len(roots) > 1 and settings.state_path is not None and args.state_dir is None:
-            raise ClientConfigurationError(
-                "--state-path cannot be shared by multiple workspaces; use --state-dir"
-            )
-        run_mcp(
-            settings,
-            workspace_roots=roots or None,
-            state_dir=Path(args.state_dir) if args.state_dir else None,
-            debounce_ms=args.debounce_ms,
-            initial_sync=args.initial_sync,
-            ready_timeout=args.ready_timeout,
-            log_level=args.log_level.upper(),
-        )
+        run_mcp_configuration(mcp_configuration_from_args(args))
         return 0
+    settings = _settings(args)
     with ClientRuntime(settings) as runtime:
         context = runtime.context()
         if args.command == "sync":

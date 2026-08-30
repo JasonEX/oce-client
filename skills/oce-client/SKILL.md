@@ -29,8 +29,9 @@ files until `sync` has completed successfully.
 
 ## MCP
 
-Run `oce-client-mcp` over stdio, or use `oce-client mcp`. The server exposes one
-tool, `codebase-retrieval`. The MCP process indexes configured workspaces in the
+Run `oce-client-mcp` over stdio, or use `oce-client mcp`. Both commands use the
+same launch options and environment loader. The server exposes one tool,
+`codebase-retrieval`. The MCP process indexes configured workspaces in the
 background and incrementally synchronizes filesystem changes. Configure an MCP
 host with explicit allowed workspaces and pass service credentials through the
 environment:
@@ -61,6 +62,12 @@ secret manager instead of writing the literal key into this file. Pass
 host has more than one configured workspace folder. Treat `status=indexing` as
 a request to retry shortly, surface `status=error` to the user, and use
 retrieval context only when `status=ready`.
+
+MCP requires an explicit workspace configuration: use repeated `--workspace`,
+`OCE_WORKSPACE`, or `OCE_WORKSPACES` (platform path separator). It never
+silently indexes the process current directory. Service settings load in this
+order: command argument, environment variable, then built-in default. API keys
+are loaded from `OCE_API_KEY` only, never from command arguments.
 
 When this skill is installed from a wheel, `oce-client skill install` copies the
 bundled skill into `$CODEX_HOME/skills/oce-client` (or `$HOME/.codex/skills/oce-client`).

@@ -27,8 +27,22 @@ defaults to `sk-opencontextengine`. `status` is local-only and does not require
 an API key. `observe` and `remove`
 stage explicit editor changes in SQLite; run `sync` to publish them. Add
 `--json` to `sync`, `status`, `retrieve`, `observe`, or `remove` for
-machine-readable output. Global options such as `--root` must
-appear before the subcommand.
+machine-readable output. CLI options are placed before the subcommand, for
+example `oce-client --root C:\src\project sync`; `--root` falls back to
+`OCE_WORKSPACE`, and `--api-url`, `--state-path`, and repeated `--ignore`
+override `OCE_API_URL`, `OCE_STATE_PATH`, and `OCE_IGNORE`.
+
+The two interfaces have different lifecycles:
+
+| Interface | Workspace selection | State selection | Index lifecycle |
+| --- | --- | --- | --- |
+| CLI | one `--root` or `OCE_WORKSPACE` | `--state-path` or `OCE_STATE_PATH` | explicit `sync`, optional `watch` |
+| MCP | repeated `--workspace`, `OCE_WORKSPACE`, or `OCE_WORKSPACES` | one `--state-path`, or per-workspace `--state-dir` | process-owned background and incremental sync |
+
+`oce-client mcp` is only a convenience spelling of `oce-client-mcp`; both use
+the same MCP argument parser and environment loader. The CLI global `--root`
+is accepted before `mcp` as a single-workspace alias; prefer `--workspace` for
+MCP configurations.
 
 ## MCP
 
@@ -48,7 +62,9 @@ read or rehashed on restart.
 Declare each allowed workspace with a repeated `--workspace` argument. With one
 workspace, the tool's `workspace_folder` input is optional. With multiple
 workspaces it is required and must exactly match an allowed path. Other paths
-are rejected.
+are rejected. For an environment-only setup, use `OCE_WORKSPACE` for one path
+or `OCE_WORKSPACES` with paths separated by the platform path separator. MCP
+does not fall back to the process current directory.
 
 ```powershell
 oce-client-mcp `
@@ -64,12 +80,15 @@ oce-client-mcp `
 defers initialization until the first retrieval call. A tool call waits up to
 `--ready-timeout` seconds for the latest observed filesystem generation. Its
 result status is `ready`, `indexing`, or `error`; only a `ready` result contains
-retrieval context. `OCE_API_URL`, `OCE_API_KEY`, `OCE_STATE_DIR`,
-`OCE_DEBOUNCE_MS`, `OCE_INITIAL_SYNC`, `OCE_READY_TIMEOUT`, and `OCE_LOG_LEVEL`
-provide environment equivalents. Keep the API key in the environment rather
-than command arguments.
+retrieval context. `OCE_API_URL`, `OCE_API_KEY`, `OCE_STATE_PATH`, `OCE_STATE_DIR`, `OCE_IGNORE`,
+`OCE_DEBOUNCE_MS`, `OCE_INITIAL_SYNC`, `OCE_READY_TIMEOUT`, and
+`OCE_LOG_LEVEL` provide environment equivalents. `--state-path` and
+`OCE_STATE_PATH` are for one workspace; use `--state-dir` or `OCE_STATE_DIR`
+for multiple workspaces. Keep the API key in the environment rather than
+command arguments.
 
-The server uses the same SQLite state and environment variables as the CLI. A
+The service endpoint, API key, and ignore patterns are shared through the same
+environment variables. State selection follows the interface table above. A
 Codex-ready skill with the host configuration and command guidance is included
 at `skills/oce-client/SKILL.md`.
 

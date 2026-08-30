@@ -12,8 +12,12 @@ import pytest
 
 pytest.importorskip("mcp.server.fastmcp")
 
-from oce_client.mcp_server import create_server
-from oce_client.runtime import ClientSettings
+from oce_client.mcp_server import (
+    build_parser as build_mcp_parser,
+    create_server,
+    mcp_configuration_from_args,
+)
+from oce_client.runtime import ClientConfigurationError, ClientSettings, McpConfiguration
 
 
 def _call(server, name: str, arguments: dict[str, object]):
@@ -285,3 +289,136 @@ def test_mcp_stdio_initialize_and_list_tools(tmp_path: Path):
     assert {tool["name"] for tool in tools} == {"codebase-retrieval"}
     schema = tools[0]["inputSchema"]
     assert schema["required"] == ["information_request"]
+
+
+def test_mcp_configuration_has_one_precedence_chain(tmp_path: Path, monkeypatch):
+    env_workspace = tmp_path / "from-env"
+    cli_workspace = tmp_path / "from-cli"
+    env_workspace.mkdir()
+    cli_workspace.mkdir()
+    monkeypatch.setenv("OCE_WORKSPACE", str(env_workspace))
+    monkeypatch.setenv("OCE_API_URL", "http://env.test")
+    monkeypatch.setenv("OCE_DEBOUNCE_MS", "900")
+    monkeypatch.setenv("OCE_INITIAL_SYNC", "blocking")
+    monkeypatch.setenv("OCE_READY_TIMEOUT", "4.5")
+    monkeypatch.setenv("OCE_LOG_LEVEL", "info")
+    monkeypatch.setenv("OCE_IGNORE", "env-a, env-b")
+
+    args = build_mcp_parser().parse_args(
+        [
+            "--workspace",
+            str(cli_workspace),
+            "--api-url",
+            "http://cli.test",
+            "--debounce-ms",
+            "250",
+            "--initial-sync",
+            "off",
+            "--ready-timeout",
+            "1.25",
+            "--log-level",
+            "error",
+            "--ignore",
+            "cli-a,cli-b",
+        ]
+    )
+    config = mcp_configuration_from_args(args)
+    assert config.workspace_roots == (cli_workspace.resolve(),)
+    assert config.client.api_url == "http://cli.test"
+    assert config.debounce_ms == 250
+    assert config.initial_sync == "off"
+    assert config.ready_timeout == 1.25
+    assert config.log_level == "error"
+    assert config.client.runtime_patterns == ("cli-a", "cli-b")
+
+
+def test_mcp_configuration_loads_environment_defaults(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OCE_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("OCE_API_URL", "http://env.test/")
+    monkeypatch.setenv("OCE_IGNORE", "*.cache\n*.generated.py")
+    monkeypatch.setenv("OCE_DEBOUNCE_MS", "750")
+    monkeypatch.setenv("OCE_INITIAL_SYNC", "off")
+    monkeypatch.setenv("OCE_READY_TIMEOUT", "2.25")
+    monkeypatch.setenv("OCE_LOG_LEVEL", "WARNING")
+
+    config = McpConfiguration.from_environment()
+    assert config.workspace_roots == (tmp_path.resolve(),)
+    assert config.client.api_url == "http://env.test"
+    assert config.client.runtime_patterns == ("*.cache", "*.generated.py")
+    assert config.debounce_ms == 750
+    assert config.initial_sync == "off"
+    assert config.ready_timeout == 2.25
+    assert config.log_level == "warning"
+
+
+def test_unified_and_standalone_mcp_accept_the_same_options(tmp_path: Path):
+    values = [
+        "--workspace",
+        str(tmp_path),
+        "--api-url",
+        "http://oce.test",
+        "--state-dir",
+        str(tmp_path / "states"),
+        "--ignore",
+        "*.generated.py",
+        "--debounce-ms",
+        "125",
+        "--initial-sync",
+        "off",
+        "--ready-timeout",
+        "2",
+        "--log-level",
+        "debug",
+    ]
+    standalone = mcp_configuration_from_args(build_mcp_parser().parse_args(values))
+    from oce_client.cli import build_parser
+
+    unified = mcp_configuration_from_args(
+        build_parser().parse_args(["mcp", *values])
+    )
+    assert unified == standalone
+
+
+def test_unified_mcp_accepts_shared_options_before_subcommand(tmp_path: Path):
+    from oce_client.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--api-url",
+            "http://before.test",
+            "--ignore",
+            "before.py",
+            "mcp",
+            "--workspace",
+            str(tmp_path),
+            "--initial-sync",
+            "off",
+        ]
+    )
+    config = mcp_configuration_from_args(args)
+    assert config.client.api_url == "http://before.test"
+    assert config.client.runtime_patterns == ("before.py",)
+
+
+def test_standalone_mcp_without_workspace_fails_cleanly(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("OCE_WORKSPACE", raising=False)
+    monkeypatch.delenv("OCE_WORKSPACES", raising=False)
+    from oce_client.mcp_server import main
+
+    assert main(["--initial-sync", "off"]) == 1
+
+
+def test_mcp_requires_explicit_workspace_when_environment_is_empty(monkeypatch):
+    monkeypatch.delenv("OCE_WORKSPACE", raising=False)
+    monkeypatch.delenv("OCE_WORKSPACES", raising=False)
+    with pytest.raises(ClientConfigurationError, match="requires at least one workspace"):
+        McpConfiguration.from_environment(workspace_roots=())
+
+
+def test_mcp_rejects_ambiguous_state_configuration(tmp_path: Path):
+    with pytest.raises(ClientConfigurationError, match="state configuration is ambiguous"):
+        McpConfiguration.from_environment(
+            workspace_roots=(tmp_path,),
+            state_path=tmp_path / "state.sqlite3",
+            state_dir=tmp_path / "states",
+        )
