@@ -15,7 +15,6 @@ It is a CLI workflow: invoke a command, read its result, and continue the task.
 - Distribution package: `opencontextengine-client`
 - Python package: `oce_client`
 - CLI executable: `oce-client`
-- Current package version: `0.1.0`
 - Check the installed CLI version with `oce-client --version`.
 
 ### Global options

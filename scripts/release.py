@@ -1,4 +1,8 @@
-"""Prepare a local release commit and annotated tag without pushing them."""
+"""Prepare a local release commit and annotated tag without pushing them.
+
+The first release accepts the current project version when no local release tag
+exists; later releases must use a higher version.
+"""
 
 from __future__ import annotations
 
@@ -64,12 +68,20 @@ def main(argv: list[str] | None = None) -> int:
     ensure_clean()
     current = bump_version.read_current_version()
     target = bump_version.resolve_version(args.version_or_part, current)
-    if current == target:
+    previous_tag = generate_changelog.latest_tag()
+    initial_release = current == target and previous_tag is None
+    if current == target and not initial_release:
         raise SystemExit(f"ERROR: version is already {current}")
 
-    print(f"Preparing release {target} (current {current})")
+    if initial_release:
+        print(f"Preparing initial release {target}")
+    else:
+        print(f"Preparing release {target} (current {current})")
     print("Plan:")
-    print(f"  1. Update pyproject.toml, __version__, and uv.lock to {target}")
+    if initial_release:
+        print(f"  1. Verify pyproject.toml, __version__, and uv.lock are {target}")
+    else:
+        print(f"  1. Update pyproject.toml, __version__, and uv.lock to {target}")
     print("  2. Generate and prepend the changelog section")
     print("  3. Build wheel and sdist")
     print(f"  4. Commit chore(release): v{target} and create annotated tag v{target}")
@@ -77,10 +89,11 @@ def main(argv: list[str] | None = None) -> int:
         print("[dry-run] No files, commits, tags, or remotes were changed")
         return 0
 
-    bump_version.update_all(target)
+    if not initial_release:
+        bump_version.update_all(target)
     section = generate_changelog.build_section(
         target,
-        since=generate_changelog.latest_tag(),
+        since=previous_tag,
     )
     if "### " not in section:
         raise SystemExit("ERROR: no releasable Conventional Commits found")

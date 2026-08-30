@@ -5,6 +5,7 @@ from typing import Sequence
 
 import httpx
 
+from . import __version__
 from .defaults import DEFAULT_API_KEY, DEFAULT_API_URL
 from .models import (
     BlobStatusResult,
@@ -40,7 +41,7 @@ class OceHttpClient:
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "oce-client/0.1",
+            "User-Agent": f"oce-client/{__version__}",
         }
 
     def close(self) -> None:

@@ -10,7 +10,7 @@ Install the distribution package with `uv add opencontextengine-client` (or
 
 ## Version Information
 
-The current client version is `0.1.0`.
+Run `oce-client --version` to print the installed client version.
 
 | Item | Value |
 | --- | --- |
@@ -22,6 +22,22 @@ The current client version is `0.1.0`.
 
 The authoritative version is declared in `pyproject.toml` and mirrored by
 `oce_client.__version__`.
+
+## Release Preparation
+
+The first release uses the current version because the repository has no
+release tag yet:
+
+```powershell
+uv run python scripts/release.py 0.1.0 --dry-run
+uv run python scripts/release.py 0.1.0
+```
+
+For later releases, use `major`, `minor`, `patch`, or an exact higher version.
+The script updates version metadata, generates the changelog, builds the
+package, creates a release commit, and creates an annotated tag locally. It
+never pushes or publishes automatically; review the result before pushing the
+branch and tag.
 
 ## CLI
 

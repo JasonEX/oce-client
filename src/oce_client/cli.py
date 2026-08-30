@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
+from . import __version__ as PACKAGE_VERSION
 from .context import BlobCompatibilityError, CheckpointResetRequired
 from .filesystem import FileAdmissionError
 from .http import OceApiError
@@ -27,7 +28,7 @@ from .runtime import (
 try:
     VERSION = importlib.metadata.version("opencontextengine-client")
 except importlib.metadata.PackageNotFoundError:
-    VERSION = "0.1.0"
+    VERSION = PACKAGE_VERSION
 
 
 def _json_default(value: object) -> object:
