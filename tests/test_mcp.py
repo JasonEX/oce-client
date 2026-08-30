@@ -265,7 +265,7 @@ def test_mcp_stdio_initialize_and_list_tools(tmp_path: Path):
     ]
     environment = os.environ.copy()
     environment["OCE_API_KEY"] = "unused-in-test"
-    result = subprocess.run(
+    process = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -275,17 +275,45 @@ def test_mcp_stdio_initialize_and_list_tools(tmp_path: Path):
             "--initial-sync",
             "off",
         ],
-        input="\n".join(json.dumps(request) for request in requests) + "\n",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        capture_output=True,
         env=environment,
-        check=True,
-        timeout=10,
     )
-    responses = [json.loads(line) for line in result.stdout.splitlines() if line]
-    assert responses[0]["id"] == 1
-    assert responses[0]["result"]["serverInfo"]["name"] == "oce-client"
-    tools = responses[1]["result"]["tools"]
+    responses: list[dict[str, object]] = []
+    tools_response = threading.Event()
+
+    def read_responses() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if not line.strip():
+                continue
+            response = json.loads(line)
+            responses.append(response)
+            if response.get("id") == 2:
+                tools_response.set()
+
+    reader = threading.Thread(target=read_responses, daemon=True)
+    reader.start()
+    try:
+        assert process.stdin is not None
+        process.stdin.write("\n".join(json.dumps(request) for request in requests) + "\n")
+        process.stdin.flush()
+        assert tools_response.wait(10), "MCP stdio server did not answer tools/list"
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=5)
+        reader.join(timeout=5)
+
+    responses_by_id = {response.get("id"): response for response in responses}
+    assert responses_by_id[1]["result"]["serverInfo"]["name"] == "oce-client"
+    tools = responses_by_id[2]["result"]["tools"]
     assert {tool["name"] for tool in tools} == {"codebase-retrieval"}
     schema = tools[0]["inputSchema"]
     assert schema["required"] == ["information_request"]
