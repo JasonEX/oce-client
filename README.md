@@ -8,6 +8,21 @@ Install the distribution package with `uv add opencontextengine-client` (or
 `pip install opencontextengine-client`). The installed command remains
 `oce-client`.
 
+## Version Information
+
+The current client version is `0.1.0`.
+
+| Item | Value |
+| --- | --- |
+| PyPI distribution | `opencontextengine-client` |
+| Python package | `oce_client` |
+| CLI | `oce-client` |
+| MCP server | `oce-client-mcp` (separate interface) |
+| Version command | `oce-client --version` |
+
+The authoritative version is declared in `pyproject.toml` and mirrored by
+`oce_client.__version__`.
+
 ## CLI
 
 Install the package with `uv` and configure the service endpoint and key through

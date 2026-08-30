@@ -17,6 +17,8 @@ Entries are generated from Conventional Commits.
 - Unify CLI and standalone MCP configuration loading with explicit workspace
   selection, documented argument/environment precedence, and environment-only
   API key loading.
+- Clarify the CLI-only Agent Skill, including command reference, retrieval
+  workflows, and synchronization requirements.
 
 ### Removed
 

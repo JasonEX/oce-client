@@ -1,73 +1,140 @@
 ---
 name: oce-client
-description: "Use the oce-client CLI or MCP server to synchronize a workspace and retrieve indexed code from OpenContextEngine."
+description: "Use the oce-client CLI to synchronize one local workspace and retrieve current code context from OpenContextEngine."
 ---
 
-# Oce Client
+# OpenContextEngine CLI
 
-Use this skill when a task needs repository code context from an OpenContextEngine service.
+This skill documents the `oce-client` command-line interface for an AI agent.
+It is a CLI workflow: invoke a command, read its result, and continue the task.
+The separate `oce-client-mcp` server and MCP configuration are outside this
+skill.
 
-## Configuration
+## 1. Command Reference
 
-Set `OCE_WORKSPACE` before invoking the client. The defaults are
-`OCE_API_URL=http://127.0.0.1:8986` and `OCE_API_KEY=sk-opencontextengine`; set
-those environment variables only when connecting to a different service or key.
-Keep API keys in the environment; never put
-them in prompts, command output, source files, or committed configuration.
+### Version and package identity
 
-The CLI is installed as `oce-client`. Global options must precede the command:
+- Distribution package: `opencontextengine-client`
+- Python package: `oce_client`
+- CLI executable: `oce-client`
+- Current package version: `0.1.0`
+- Check the installed CLI version with `oce-client --version`.
+
+### Global options
+
+Global options must appear before the subcommand:
 
 ```text
-oce-client --root <workspace> sync
-oce-client --root <workspace> retrieve "where is authentication implemented?"
+oce-client --root <workspace> --api-url <url> --state-path <file> <command>
 ```
 
-Use `status` for local state, `observe <path> --content <text>` for an explicit unsaved
-overlay, and `remove <path>` to stage a deletion. Add `--json` to machine-readable
-commands when passing results to another tool. Do not claim retrieval reflects current
-files until `sync` has completed successfully.
+- `--root`: workspace directory; otherwise use `OCE_WORKSPACE`, then the
+  current directory.
+- `--api-url`: service URL; otherwise use `OCE_API_URL`, then
+  `http://127.0.0.1:8986`.
+- `--state-path`: SQLite state file; otherwise use `OCE_STATE_PATH`, then
+  `<workspace>/.oce-client/state.sqlite3`.
+- `--ignore PATTERN`: add a runtime ignore pattern; repeat it when needed.
 
-## MCP
+The API key has no CLI option. Load it through `OCE_API_KEY`; the local default
+is `sk-opencontextengine`.
 
-Run `oce-client-mcp` over stdio. The server exposes one tool,
-`codebase-retrieval`. The MCP process indexes configured workspaces in the
-background and incrementally synchronizes filesystem changes. Configure an MCP
-host with explicit allowed workspaces and pass service credentials through the
-environment:
+### Workspace commands
 
-```json
-{
-  "mcpServers": {
-    "oce": {
-      "command": "oce-client-mcp",
-      "args": [
-        "--workspace",
-        "/path/to/workspace",
-        "--initial-sync",
-        "background"
-      ],
-      "env": {
-        "OCE_API_URL": "http://127.0.0.1:8986",
-        "OCE_API_KEY": "${OCE_API_KEY}"
-      }
-    }
-  }
-}
+```text
+oce-client --root <workspace> sync [--json]
+oce-client --root <workspace> status [--json]
+oce-client --root <workspace> retrieve [--scope workspace|working_set] [--json] <query>
+oce-client --root <workspace> observe <path> [--content <text> | --file <file>] [--json]
+oce-client --root <workspace> remove <path> [--json]
+oce-client --root <workspace> watch [--debounce-ms <milliseconds>]
+oce-client skill path [--json]
+oce-client skill install [--target <directory>] [--force] [--json]
 ```
 
-When the host cannot expand environment placeholders, configure the secret through its
-secret manager instead of writing the literal key into this file. Pass
-`information_request` to `codebase-retrieval`; pass `workspace_folder` when the
-host has more than one configured workspace folder. Treat `status=indexing` as
-a request to retry shortly, surface `status=error` to the user, and use
-retrieval context only when `status=ready`.
+- `sync` scans the workspace, uploads new or changed blobs, and commits a new
+  server checkpoint. This is the command that makes retrieval reflect the
+  current files.
+- `status` reads only the local SQLite inventory and checkpoint. It does not
+  contact the service and does not require an API key.
+- `retrieve` sends a natural-language code question to the service using the
+  last local checkpoint. Use `--scope` only when the task requires the
+  corresponding retrieval scope.
+- `observe` stages explicit editor content in the local state. It does not
+  publish the content until `sync` runs.
+- `remove` stages a workspace-relative deletion. It also requires `sync` to
+  publish the change.
+- `watch` keeps a foreground process alive and incrementally syncs filesystem
+  changes. Run an initial successful `sync` before starting it.
 
-MCP requires an explicit workspace configuration: use repeated `--workspace`,
-`OCE_WORKSPACE`, or `OCE_WORKSPACES` (platform path separator). It never
-silently indexes the process current directory. Service settings load in this
-order: command argument, environment variable, then built-in default. API keys
-are loaded from `OCE_API_KEY` only, never from command arguments.
+`skill path` and `skill install` are installation maintenance commands; they
+are not part of normal code retrieval.
 
-When this skill is installed from a wheel, `oce-client skill install` copies the
-bundled skill into `$CODEX_HOME/skills/oce-client` (or `$HOME/.codex/skills/oce-client`).
-It does not overwrite an existing directory unless `--force` is supplied.
+## 2. Workflow
+
+### One-shot retrieval
+
+Use this workflow when no long-running watcher is already maintaining the
+workspace:
+
+```text
+1. Set OCE_WORKSPACE, OCE_API_URL, and OCE_API_KEY in the process environment.
+2. Run `oce-client --root <workspace> sync --json`.
+3. Run `oce-client --root <workspace> retrieve --json "<natural-language question>"`.
+4. Parse JSON from stdout and use `formatted_retrieval` as code context.
+```
+
+Run `sync` again before a later retrieval when files may have changed. The
+client persists inventory and checkpoint state, so unchanged files are not
+uploaded again.
+
+### Session retrieval with a watcher
+
+For several questions against the same workspace:
+
+```text
+1. Run one successful `sync`.
+2. Start `oce-client --root <workspace> watch` and keep it running.
+3. Invoke `retrieve --json` for each AI question while the watcher is alive.
+4. Stop the watcher when the workspace session ends.
+```
+
+The watcher handles changed paths incrementally. If it is stopped, return to
+the one-shot workflow and run `sync` before retrieving.
+
+### Unsaved editor state
+
+When the agent has content that is not yet written to disk:
+
+```text
+oce-client --root <workspace> observe src/example.py --content "<text>"
+oce-client --root <workspace> sync --json
+oce-client --root <workspace> retrieve --json "<question>"
+```
+
+Use `remove` followed by `sync` for an unsaved deletion.
+
+## 3. Important Notes
+
+- This CLI handles one workspace per invocation. Pass the workspace explicitly
+  when the agent knows it; do not accidentally index the agent's own process
+  directory.
+- Keep `OCE_API_KEY` in the environment or a secret manager. Never put the key
+  in prompts, command arguments, logs, JSON output, or committed files.
+- Use `--json` whenever another program or agent will consume the result.
+  Treat stdout as the data channel and stderr as diagnostics.
+- A successful `status` only proves that local state exists; it does not prove
+  that the files on disk have been synchronized. Do not claim that retrieval is
+  current until `sync` has succeeded or an active `watch` has processed the
+  changes.
+- `sync` and `retrieve` can take time on a first run or after a large change.
+  Do not retry them concurrently against the same state file.
+- The CLI has no `--initial-sync` or background initialization mode. The
+  long-running `watch` command is foreground process supervision; the separate
+  MCP interface has its own lifecycle and is not covered by this skill.
+- Retrieval describes the current code on disk and the selected checkpoint. It
+  has no version-control history or knowledge of previous commits.
+- Quote workspace paths and natural-language queries. Use workspace-relative
+  paths with `observe` and `remove`.
+- A zero exit code means the command completed successfully. A non-zero exit
+  code means the result should not be treated as valid context; inspect stderr.
