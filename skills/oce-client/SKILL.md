@@ -7,8 +7,6 @@ description: "Use the oce-client CLI to synchronize one local workspace and retr
 
 This skill documents the `oce-client` command-line interface for an AI agent.
 It is a CLI workflow: invoke a command, read its result, and continue the task.
-The separate `oce-client-mcp` server and MCP configuration are outside this
-skill.
 
 ## 1. Command Reference
 
@@ -129,9 +127,8 @@ Use `remove` followed by `sync` for an unsaved deletion.
   changes.
 - `sync` and `retrieve` can take time on a first run or after a large change.
   Do not retry them concurrently against the same state file.
-- The CLI has no `--initial-sync` or background initialization mode. The
-  long-running `watch` command is foreground process supervision; the separate
-  MCP interface has its own lifecycle and is not covered by this skill.
+- Use only the commands and options documented above. In particular, do not
+  invent a background or initial-sync option for this one-shot CLI.
 - Retrieval describes the current code on disk and the selected checkpoint. It
   has no version-control history or knowledge of previous commits.
 - Quote workspace paths and natural-language queries. Use workspace-relative
