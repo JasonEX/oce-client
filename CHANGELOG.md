@@ -21,3 +21,4 @@ Entries are generated from Conventional Commits.
 ### Removed
 
 - Remove unsupported project overview and retrieval-paths service endpoints.
+- Remove the redundant `oce-client mcp` CLI subcommand; use `oce-client-mcp`.

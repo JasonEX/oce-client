@@ -39,11 +39,6 @@ The two interfaces have different lifecycles:
 | CLI | one `--root` or `OCE_WORKSPACE` | `--state-path` or `OCE_STATE_PATH` | explicit `sync`, optional `watch` |
 | MCP | repeated `--workspace`, `OCE_WORKSPACE`, or `OCE_WORKSPACES` | one `--state-path`, or per-workspace `--state-dir` | process-owned background and incremental sync |
 
-`oce-client mcp` is only a convenience spelling of `oce-client-mcp`; both use
-the same MCP argument parser and environment loader. The CLI global `--root`
-is accepted before `mcp` as a single-workspace alias; prefer `--workspace` for
-MCP configurations.
-
 ## MCP
 
 Install the optional MCP extra and expose the stdio server to an MCP host:

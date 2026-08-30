@@ -29,8 +29,7 @@ files until `sync` has completed successfully.
 
 ## MCP
 
-Run `oce-client-mcp` over stdio, or use `oce-client mcp`. Both commands use the
-same launch options and environment loader. The server exposes one tool,
+Run `oce-client-mcp` over stdio. The server exposes one tool,
 `codebase-retrieval`. The MCP process indexes configured workspaces in the
 background and incrementally synchronizes filesystem changes. Configure an MCP
 host with explicit allowed workspaces and pass service credentials through the

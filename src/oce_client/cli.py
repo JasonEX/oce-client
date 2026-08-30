@@ -15,7 +15,6 @@ from typing import Sequence
 from .context import BlobCompatibilityError, CheckpointResetRequired
 from .filesystem import FileAdmissionError
 from .http import OceApiError
-from .mcp_server import add_mcp_arguments, mcp_configuration_from_args, run_mcp_configuration
 from .runtime import (
     DEFAULT_API_URL,
     ClientConfigurationError,
@@ -128,10 +127,6 @@ def build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser("watch", help="watch the workspace and sync on changes")
     watch.add_argument("--debounce-ms", type=int, default=300)
 
-    mcp = subparsers.add_parser("mcp", help="run the MCP server over stdio")
-    add_mcp_arguments(mcp)
-    mcp.set_defaults(command="mcp")
-
     skill = subparsers.add_parser("skill", help="locate or install the Codex skill")
     skill_subparsers = skill.add_subparsers(dest="skill_command", required=True)
     skill_path = skill_subparsers.add_parser("path", help="print the bundled skill path")
@@ -144,17 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _settings(args: argparse.Namespace) -> ClientSettings:
-    root = args.root
-    if args.command == "mcp" and args.workspace:
-        root = args.workspace[0]
     return ClientSettings.from_environment(
-        root=root,
+        root=args.root,
         api_url=args.api_url,
         state_path=args.state_path,
         runtime_patterns=(
             iter_runtime_patterns(iter(args.ignore)) if args.ignore else None
         ),
-        require_api_key=args.command in {"sync", "retrieve", "watch", "mcp"},
+        require_api_key=args.command in {"sync", "retrieve", "watch"},
     )
 
 
@@ -181,9 +173,6 @@ def _run(args: argparse.Namespace) -> int:
             _dump(payload)
         else:
             print(f"installed skill at {target}")
-        return 0
-    if args.command == "mcp":
-        run_mcp_configuration(mcp_configuration_from_args(args))
         return 0
     settings = _settings(args)
     with ClientRuntime(settings) as runtime:

@@ -39,7 +39,7 @@ def _require_sdk() -> Any:
 
 
 def add_mcp_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the exact MCP launch options to either supported entry point."""
+    """Add the MCP server launch options to the standalone entry point."""
     parser.add_argument(
         "--workspace",
         action="append",
@@ -97,8 +97,6 @@ def add_mcp_arguments(parser: argparse.ArgumentParser) -> None:
 
 def mcp_configuration_from_args(args: argparse.Namespace) -> McpConfiguration:
     values = getattr(args, "workspace", None)
-    if not values and getattr(args, "root", None):
-        values = (args.root,)
     return McpConfiguration.from_environment(
         workspace_roots=tuple(values) if values else None,
         api_url=getattr(args, "api_url", None),

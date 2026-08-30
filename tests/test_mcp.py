@@ -351,55 +351,6 @@ def test_mcp_configuration_loads_environment_defaults(tmp_path: Path, monkeypatc
     assert config.log_level == "warning"
 
 
-def test_unified_and_standalone_mcp_accept_the_same_options(tmp_path: Path):
-    values = [
-        "--workspace",
-        str(tmp_path),
-        "--api-url",
-        "http://oce.test",
-        "--state-dir",
-        str(tmp_path / "states"),
-        "--ignore",
-        "*.generated.py",
-        "--debounce-ms",
-        "125",
-        "--initial-sync",
-        "off",
-        "--ready-timeout",
-        "2",
-        "--log-level",
-        "debug",
-    ]
-    standalone = mcp_configuration_from_args(build_mcp_parser().parse_args(values))
-    from oce_client.cli import build_parser
-
-    unified = mcp_configuration_from_args(
-        build_parser().parse_args(["mcp", *values])
-    )
-    assert unified == standalone
-
-
-def test_unified_mcp_accepts_shared_options_before_subcommand(tmp_path: Path):
-    from oce_client.cli import build_parser
-
-    args = build_parser().parse_args(
-        [
-            "--api-url",
-            "http://before.test",
-            "--ignore",
-            "before.py",
-            "mcp",
-            "--workspace",
-            str(tmp_path),
-            "--initial-sync",
-            "off",
-        ]
-    )
-    config = mcp_configuration_from_args(args)
-    assert config.client.api_url == "http://before.test"
-    assert config.client.runtime_patterns == ("before.py",)
-
-
 def test_standalone_mcp_without_workspace_fails_cleanly(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("OCE_WORKSPACE", raising=False)
     monkeypatch.delenv("OCE_WORKSPACES", raising=False)
