@@ -389,79 +389,55 @@ class WorkspaceContext:
 
     def _sync_reconciled(self) -> SyncResult:
         plan = self.plan_sync()
-        payload = {
-            "delta": plan.delta.to_api_dict(),
-            "uploads": [
-                {"path": upload.path, "blob_name": upload.blob_name}
-                for upload in plan.uploads
-            ],
+        # The current inventory and committed checkpoint are the durable retry
+        # state. A failed attempt leaves synced_generation unchanged, so the next
+        # sync safely derives a fresh idempotent plan instead of replaying requests.
+        rows = self.state.load_file_rows()
+        current_records = {
+            str(row["blob_name"]): row
+            for row in rows
+            if row["status"] == FileStatus.PRESENT.value and row["blob_name"]
         }
-        # A new sync is a durable retry of any prior failed attempt. The current
-        # inventory is authoritative, so retrying from a fresh plan is idempotent.
-        self.state.supersede_pending()
-        operation_id = self.state.add_outbox("sync", payload)
-        try:
-            rows = self.state.load_file_rows()
-            current_records = {
-                str(row["blob_name"]): row
-                for row in rows
-                if row["status"] == FileStatus.PRESENT.value and row["blob_name"]
-            }
-            current_names = tuple(sorted(current_records))
-            checkpoint_id = plan.delta.checkpoint_id
-            if checkpoint_id is not None:
-                status = self.api.blob_status((), checkpoint_id)
-                if status.checkpoint_not_found:
-                    checkpoint_id = None
-            names_to_check = (
-                current_names if checkpoint_id is None else plan.delta.added_blobs
+        current_names = tuple(sorted(current_records))
+        checkpoint_id = plan.delta.checkpoint_id
+        if checkpoint_id is not None:
+            status = self.api.blob_status((), checkpoint_id)
+            if status.checkpoint_not_found:
+                checkpoint_id = None
+        names_to_check = (
+            current_names if checkpoint_id is None else plan.delta.added_blobs
+        )
+        unknown: set[str] = set()
+        nonindexed: set[str] = set()
+        for offset in range(0, len(names_to_check), self.max_find_missing):
+            missing = self.api.find_missing(
+                names_to_check[offset : offset + self.max_find_missing]
             )
-            unknown: set[str] = set()
-            nonindexed: set[str] = set()
-            for offset in range(0, len(names_to_check), self.max_find_missing):
-                missing = self.api.find_missing(
-                    names_to_check[offset : offset + self.max_find_missing]
-                )
-                unknown.update(missing.unknown_blob_names)
-                nonindexed.update(missing.nonindexed_blob_names)
-            to_upload = unknown | nonindexed
-            uploaded_names: set[str] = set()
-            batch: list[BlobUpload] = []
-            batch_bytes = 0
-            for name in sorted(to_upload):
-                record = current_records.get(name)
-                if record is None:
-                    raise BlobCompatibilityError(
-                        f"missing local record for blob {name}"
-                    )
-                path = str(record["path"])
-                content = self.state.load_file_content(path)
-                if content is None:
-                    content = self.file_source.read(self.root / Path(path))
-                actual_name = self.identity.calculate(path, content)
-                if actual_name != name:
-                    raise BlobCompatibilityError(f"file changed during sync: {path}")
-                upload = BlobUpload(path, content, name)
-                upload_bytes = len(upload.path.encode("utf-8")) + len(
-                    upload.content.encode("utf-8")
-                )
-                if batch and (
-                    len(batch) >= self.max_upload_blobs
-                    or batch_bytes + upload_bytes > self.max_upload_bytes
-                ):
-                    result = self.api.batch_upload(batch)
-                    expected = {item.blob_name for item in batch}
-                    received = set(result.blob_names)
-                    if received != expected:
-                        raise BlobCompatibilityError(
-                            f"batch-upload returned {sorted(received)}; expected {sorted(expected)}"
-                        )
-                    uploaded_names.update(received)
-                    batch = []
-                    batch_bytes = 0
-                batch.append(upload)
-                batch_bytes += upload_bytes
-            if batch:
+            unknown.update(missing.unknown_blob_names)
+            nonindexed.update(missing.nonindexed_blob_names)
+        to_upload = unknown | nonindexed
+        uploaded_names: set[str] = set()
+        batch: list[BlobUpload] = []
+        batch_bytes = 0
+        for name in sorted(to_upload):
+            record = current_records.get(name)
+            if record is None:
+                raise BlobCompatibilityError(f"missing local record for blob {name}")
+            path = str(record["path"])
+            content = self.state.load_file_content(path)
+            if content is None:
+                content = self.file_source.read(self.root / Path(path))
+            actual_name = self.identity.calculate(path, content)
+            if actual_name != name:
+                raise BlobCompatibilityError(f"file changed during sync: {path}")
+            upload = BlobUpload(path, content, name)
+            upload_bytes = len(upload.path.encode("utf-8")) + len(
+                upload.content.encode("utf-8")
+            )
+            if batch and (
+                len(batch) >= self.max_upload_blobs
+                or batch_bytes + upload_bytes > self.max_upload_bytes
+            ):
                 result = self.api.batch_upload(batch)
                 expected = {item.blob_name for item in batch}
                 received = set(result.blob_names)
@@ -470,55 +446,62 @@ class WorkspaceContext:
                         f"batch-upload returned {sorted(received)}; expected {sorted(expected)}"
                     )
                 uploaded_names.update(received)
-            uploaded = tuple(sorted(uploaded_names))
-            self._wait_ready(tuple(sorted(to_upload)), None)
-            checkpoint_added = (
-                current_names if checkpoint_id is None else plan.delta.added_blobs
-            )
-            checkpoint_deleted = (
-                () if checkpoint_id is None else plan.delta.deleted_blobs
-            )
-            try:
-                if checkpoint_added or checkpoint_deleted or checkpoint_id is None:
-                    result = self.api.checkpoint(
-                        checkpoint_id,
-                        checkpoint_added,
-                        checkpoint_deleted,
-                    )
-                    checkpoint_id = result.new_checkpoint_id
-            except OceApiError as exc:
-                if exc.status_code != 404:
-                    raise
-                # The chain disappeared after the liveness check. Keep the local token
-                # until the replacement succeeds so a failed rebuild remains retryable.
-                missing = self.api.find_missing(current_names)
-                if missing.unknown_blob_names or missing.nonindexed_blob_names:
-                    raise CheckpointResetRequired(
-                        "server checkpoint and blob state changed; retry sync"
-                    ) from exc
-                checkpoint_added = current_names
-                checkpoint_deleted = ()
-                result = self.api.checkpoint(None, current_names, ())
+                batch = []
+                batch_bytes = 0
+            batch.append(upload)
+            batch_bytes += upload_bytes
+        if batch:
+            result = self.api.batch_upload(batch)
+            expected = {item.blob_name for item in batch}
+            received = set(result.blob_names)
+            if received != expected:
+                raise BlobCompatibilityError(
+                    f"batch-upload returned {sorted(received)}; expected {sorted(expected)}"
+                )
+            uploaded_names.update(received)
+        uploaded = tuple(sorted(uploaded_names))
+        self._wait_ready(tuple(sorted(to_upload)), None)
+        checkpoint_added = (
+            current_names if checkpoint_id is None else plan.delta.added_blobs
+        )
+        checkpoint_deleted = () if checkpoint_id is None else plan.delta.deleted_blobs
+        try:
+            if checkpoint_added or checkpoint_deleted or checkpoint_id is None:
+                result = self.api.checkpoint(
+                    checkpoint_id,
+                    checkpoint_added,
+                    checkpoint_deleted,
+                )
                 checkpoint_id = result.new_checkpoint_id
-            deleted_paths = [
-                row["path"]
-                for row in self.state.load_file_rows()
-                if row["status"] != FileStatus.PRESENT
-                and row["committed_blob_name"] in set(plan.delta.deleted_blobs)
-            ]
-            self.state.commit_sync(
-                checkpoint_id or "", deleted_paths, self.snapshot().generation
-            )
-            self.state.update_outbox(operation_id, "complete")
-            return SyncResult(
-                uploaded,
-                checkpoint_id,
-                checkpoint_added,
-                checkpoint_deleted,
-            )
-        except Exception as exc:
-            self.state.update_outbox(operation_id, "failed", str(exc))
-            raise
+        except OceApiError as exc:
+            if exc.status_code != 404:
+                raise
+            # The chain disappeared after the liveness check. Keep the local token
+            # until the replacement succeeds so a failed rebuild remains retryable.
+            missing = self.api.find_missing(current_names)
+            if missing.unknown_blob_names or missing.nonindexed_blob_names:
+                raise CheckpointResetRequired(
+                    "server checkpoint and blob state changed; retry sync"
+                ) from exc
+            checkpoint_added = current_names
+            checkpoint_deleted = ()
+            result = self.api.checkpoint(None, current_names, ())
+            checkpoint_id = result.new_checkpoint_id
+        deleted_paths = [
+            row["path"]
+            for row in self.state.load_file_rows()
+            if row["status"] != FileStatus.PRESENT
+            and row["committed_blob_name"] in set(plan.delta.deleted_blobs)
+        ]
+        self.state.commit_sync(
+            checkpoint_id or "", deleted_paths, self.snapshot().generation
+        )
+        return SyncResult(
+            uploaded,
+            checkpoint_id,
+            checkpoint_added,
+            checkpoint_deleted,
+        )
 
     def retrieve(self, query: str, *, scope: str = "workspace") -> RetrievalResult:
         if scope not in {"workspace", "working_set"}:

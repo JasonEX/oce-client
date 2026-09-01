@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -12,7 +10,7 @@ from .models import FileRecord, FileStatus, WorkspaceSnapshot
 
 
 class SQLiteStateStore:
-    """Durable workspace state with an outbox-friendly transactional boundary."""
+    """Durable workspace state for incremental reconciliation."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -49,15 +47,6 @@ class SQLiteStateStore:
                     source TEXT NOT NULL DEFAULT 'filesystem',
                     generation INTEGER NOT NULL DEFAULT 0,
                     skip_reason TEXT
-                );
-                CREATE TABLE IF NOT EXISTS outbox_operations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    kind TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    created_at REAL NOT NULL
                 );
                 """
             )
@@ -257,32 +246,4 @@ class SQLiteStateStore:
                 "INSERT INTO meta(key,value) VALUES('synced_generation',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(generation),),
-            )
-
-    def add_outbox(self, kind: str, payload: dict[str, object]) -> int:
-        with self.transaction() as conn:
-            cursor = conn.execute(
-                "INSERT INTO outbox_operations(kind,payload,created_at) VALUES(?,?,?)",
-                (kind, json.dumps(payload, separators=(",", ":")), time.time()),
-            )
-            return int(cursor.lastrowid)
-
-    def update_outbox(self, operation_id: int, status: str, error: str | None = None) -> None:
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE outbox_operations SET status=?, attempts=attempts+1, last_error=? WHERE id=?",
-                (status, error, operation_id),
-            )
-
-    def pending_outbox(self) -> list[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM outbox_operations WHERE status != 'complete' ORDER BY id"
-        ).fetchall()
-
-    def supersede_pending(self) -> None:
-        """Mark older attempts as superseded before a fresh sync is planned."""
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE outbox_operations SET status = 'superseded' "
-                "WHERE status IN ('pending', 'failed')"
             )

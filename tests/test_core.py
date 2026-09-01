@@ -304,7 +304,13 @@ def test_upload_failure_does_not_advance_checkpoint(tmp_path: Path):
         with pytest.raises(RuntimeError):
             context.sync()
         assert context.snapshot().checkpoint_id is None
-        assert context.state.pending_outbox()
+        assert context.state.get_meta("synced_generation") is None
+
+        api.fail_upload = False
+        retried = context.sync()
+
+        assert retried.checkpoint_id is not None
+        assert tuple(sorted(api.checkpoint_members)) == retried.added_blobs
     finally:
         context.close()
 

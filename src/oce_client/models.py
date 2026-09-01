@@ -43,13 +43,6 @@ class BlobDelta:
     added_blobs: tuple[str, ...] = ()
     deleted_blobs: tuple[str, ...] = ()
 
-    def to_api_dict(self) -> dict[str, object]:
-        return {
-            "checkpoint_id": self.checkpoint_id or "",
-            "added_blobs": list(self.added_blobs),
-            "deleted_blobs": list(self.deleted_blobs),
-        }
-
 
 @dataclass(frozen=True)
 class UploadPlan:
