@@ -145,3 +145,14 @@ available. Symbolic links are not read or uploaded, including links that point
 outside the workspace. Other admitted source files are uploaded to the configured OCE
 service and may then be sent to its embedding or LLM providers. Add project-specific
 secret or data paths to `.oceignore` before the first sync.
+
+## Retrieval benchmark
+
+The source-backed harness in [`benchmarks/`](benchmarks/README.md) runs the real client
+sync/checkpoint/retrieval path against 50 reviewed queries on pinned public revisions. It
+reports retrieval quality, latency, returned context size, optional external-model usage and
+cost, and separately supplied agent-task outcomes. Failed syncs and retrievals remain in the
+result as zero-scored evidence.
+
+Use isolated server sessions and data directories for each variant so model, routing, and
+reranking changes can be attributed rather than mixed inside one agent session.

@@ -1,0 +1,10 @@
+{
+  "oce": {
+    "revision": "4264ea29e2bb91d0473a24cb4d254aa7f9302a93",
+    "url": "https://github.com/oce-ai/oce.git"
+  },
+  "oce-client": {
+    "revision": "e214d0fbbc5ad9d378b8d0f65e1688bf0a1265e3",
+    "url": "https://github.com/oce-ai/oce-client.git"
+  }
+}

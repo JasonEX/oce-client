@@ -5,6 +5,10 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+### Added
+
+- **benchmark**: add a pinned 50-case retrieval, cost, and agent-outcome evaluation harness
+
 ### Fixed
 
 - **admission**: exclude common secret files and symbolic links from workspace uploads
