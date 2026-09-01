@@ -64,6 +64,10 @@ class FakeApi:
         return CheckpointResult(self.checkpoint_id)
 
     def retrieve(self, query, checkpoint_id, added, deleted):
+        if checkpoint_id is not None and checkpoint_id != self.checkpoint_id:
+            from oce_client import OceApiError
+
+            raise OceApiError(404, "missing checkpoint")
         return RetrievalResult(f"{query}:{checkpoint_id}")
 
 
@@ -347,6 +351,29 @@ def test_failed_checkpoint_rebuild_preserves_retry_state(tmp_path: Path):
         assert api.checkpoint_calls[-1] == (None, current_names, ())
         assert tuple(sorted(api.checkpoint_members)) == current_names
         assert rebuilt.checkpoint_id is not None
+    finally:
+        context.close()
+
+
+def test_retrieve_recovers_checkpoint_lost_after_sync(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    api = FakeApi()
+    context = WorkspaceContext.open(tmp_path, api, ready_poll_attempts=1)
+    try:
+        first = context.sync()
+        current_names = tuple(sorted(api.checkpoint_members))
+        api.checkpoint_id = None
+        api.checkpoint_members.clear()
+
+        result = context.retrieve("find a")
+
+        assert api.checkpoint_calls[-1] == (None, current_names, ())
+        assert tuple(sorted(api.checkpoint_members)) == current_names
+        assert context.snapshot().checkpoint_id is not None
+        assert result.formatted_retrieval == (
+            f"find a:{context.snapshot().checkpoint_id}"
+        )
+        assert first.checkpoint_id is not None
     finally:
         context.close()
 

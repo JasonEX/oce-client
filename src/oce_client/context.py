@@ -527,6 +527,17 @@ class WorkspaceContext:
             "generation"
         ):
             self.sync()
+        try:
+            return self._retrieve_current(query)
+        except OceApiError as exc:
+            if exc.status_code != 404:
+                raise
+            # A checkpoint may expire after the last successful sync. Reconcile once
+            # and retry with the replacement token; a second 404 remains visible.
+            self.sync()
+            return self._retrieve_current(query)
+
+    def _retrieve_current(self, query: str) -> RetrievalResult:
         snapshot = self.snapshot()
         names = tuple(
             sorted(
