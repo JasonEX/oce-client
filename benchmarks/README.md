@@ -10,6 +10,8 @@ configuration, references, and bug localization.
 recall, selection, and model reranking. A named run is accepted only when the server's
 authenticated `/admin/index-stats` runtime profile matches every declared switch. This
 prevents a result label from silently describing a configuration that was not running.
+The same preflight requires a compatible persisted index fingerprint and records the
+resolved embedding model and dimensions reported by the server.
 
 The harness reports Top-1, Recall@10, MRR, nDCG@10, returned characters, and end-to-end
 latency. Workspace-sync and query errors remain in the raw result and score as zero rather
@@ -60,10 +62,12 @@ uv run python benchmarks/evaluate.py run \
   --output /tmp/oce-results/dense-exact-path.json
 ```
 
-`OCE_ADMIN_API_KEY` is mandatory for named variants: the harness checks the live chunking,
-recall, priority, selector, rerank, rewrite, intent, decomposition, and query-cache settings
-before any workspace sync. The checked-in variants disable the query-vector cache so one
-run cannot benefit from warm queries left by another.
+`OCE_ADMIN_API_KEY` is mandatory for named variants: the harness checks the live embedding,
+chunking, recall, priority, selector, rerank, rewrite, intent, decomposition, and query-cache
+settings before any workspace sync. It also requires the server's persisted index profile
+to be compatible, fingerprinted, and backed by a resolved embedding model/dimension. The
+checked-in variants disable the query-vector cache so one run cannot benefit from warm
+queries left by another.
 
 The default six-second settling interval allows the asynchronous metrics buffer to flush
 before snapshots. Pass prices in USD per million tokens when a cost estimate is wanted:

@@ -24,6 +24,7 @@ DEFAULT_CASES = ROOT / "cases.jsonl"
 DEFAULT_VARIANTS = ROOT / "variants.json"
 
 VARIANT_PROFILE_FIELDS = {
+    "EMBED_ENABLED": ("runtime", "embedding_enabled"),
     "CHUNKING_SEMANTIC_ENABLED": ("runtime", "semantic_chunking_enabled"),
     "RETRIEVAL_EXACT_ENABLED": ("runtime", "exact_enabled"),
     "RETRIEVAL_PATH_INDEX_ENABLED": ("runtime", "path_index_enabled"),
@@ -487,6 +488,42 @@ def verify_variant_profile(
         if type(actual) is not type(expected) or actual != expected:
             mismatches.append(
                 f"{environment_name} expected {expected!r}, got {actual!r}"
+            )
+    index_profile = index_stats.get("profile")
+    if not isinstance(index_profile, dict):
+        mismatches.append("index profile is missing")
+    else:
+        actual_profile["profile"] = {
+            key: index_profile.get(key)
+            for key in (
+                "state",
+                "fingerprint",
+                "schema_version",
+                "embedding_enabled",
+                "embedding_model",
+                "embedding_dimensions",
+            )
+        }
+        if index_profile.get("state") != "compatible":
+            mismatches.append(
+                "index profile state expected 'compatible', "
+                f"got {index_profile.get('state')!r}"
+            )
+        fingerprint = index_profile.get("fingerprint")
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            mismatches.append("index profile fingerprint is missing or invalid")
+        if index_profile.get("embedding_enabled") is not True:
+            mismatches.append("persisted index profile does not enable embedding")
+        if not isinstance(index_profile.get("embedding_model"), str):
+            mismatches.append("persisted index profile has no embedding model")
+        dimensions = index_profile.get("embedding_dimensions")
+        if (
+            not isinstance(dimensions, int)
+            or isinstance(dimensions, bool)
+            or dimensions < 1
+        ):
+            mismatches.append(
+                "persisted index profile has invalid embedding dimensions"
             )
     if mismatches:
         raise ValueError(

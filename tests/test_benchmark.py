@@ -50,6 +50,7 @@ def test_variant_profile_must_match_live_server_controls():
     variant = load_variants()["full-no-rerank"]
     index_stats = {
         "runtime": {
+            "embedding_enabled": True,
             "semantic_chunking_enabled": True,
             "exact_enabled": True,
             "path_index_enabled": True,
@@ -62,15 +63,29 @@ def test_variant_profile_must_match_live_server_controls():
             "intent_classification_enabled": False,
         },
         "query_cache": {"max_entries": 0},
+        "profile": {
+            "state": "compatible",
+            "fingerprint": "a" * 64,
+            "schema_version": 1,
+            "embedding_enabled": True,
+            "embedding_model": "embedding-v1",
+            "embedding_dimensions": 1024,
+        },
     }
 
     profile = verify_variant_profile(variant, index_stats)
 
     assert profile["runtime"]["exact_enabled"] is True
     assert profile["query_cache"]["max_entries"] == 0
+    assert profile["profile"]["embedding_model"] == "embedding-v1"
 
     index_stats["runtime"]["exact_enabled"] = False
     with pytest.raises(ValueError, match="RETRIEVAL_EXACT_ENABLED"):
+        verify_variant_profile(variant, index_stats)
+
+    index_stats["runtime"]["exact_enabled"] = True
+    index_stats["profile"]["state"] = "stored_unverified"
+    with pytest.raises(ValueError, match="index profile state"):
         verify_variant_profile(variant, index_stats)
 
 
