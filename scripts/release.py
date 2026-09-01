@@ -21,9 +21,8 @@ import generate_changelog
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_FILES = [
-    "pyproject.toml",
-    "src/oce_client/__init__.py",
-    "uv.lock",
+    "Cargo.toml",
+    "Cargo.lock",
     "CHANGELOG.md",
 ]
 
@@ -79,11 +78,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Preparing release {target} (current {current})")
     print("Plan:")
     if initial_release:
-        print(f"  1. Verify pyproject.toml, __version__, and uv.lock are {target}")
+        print(f"  1. Verify Cargo.toml and Cargo.lock are {target}")
     else:
-        print(f"  1. Update pyproject.toml, __version__, and uv.lock to {target}")
+        print(f"  1. Update Cargo.toml and Cargo.lock to {target}")
     print("  2. Generate and prepend the changelog section")
-    print("  3. Build wheel and sdist")
+    print("  3. Build the release binary")
     print(f"  4. Commit chore(release): v{target} and create annotated tag v{target}")
     if args.dry_run:
         print("[dry-run] No files, commits, tags, or remotes were changed")
@@ -99,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("ERROR: no releasable Conventional Commits found")
     generate_changelog.prepend_release(section)
 
-    run(["uv", "build"])
+    run(["cargo", "build", "--release", "--locked"])
     run(["git", "add", *RELEASE_FILES])
     run(["git", "commit", "-m", f"chore(release): v{target}"])
     run(
@@ -117,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Review the commit and tag, then push them explicitly when ready:")
     print("  git push origin master")
     print(f"  git push origin v{target}")
-    print("Pushing the tag triggers the trusted-publishing release workflow.")
+    print("Pushing the tag triggers the GitHub binary release workflow.")
     return 0
 
 

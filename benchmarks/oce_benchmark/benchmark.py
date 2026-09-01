@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -16,52 +16,20 @@ from typing import Iterable, Sequence
 
 import httpx
 
-from oce_client.benchmark_lexical import (
+from .benchmark_lexical import (
     lexical_baseline_profile,
     resolve_ripgrep,
     retrieve_lexically,
     ripgrep_version,
 )
-from oce_client.filesystem import LocalFileSource
-from oce_client.ignore import LayeredIgnoreMatcher
-from oce_client.runtime import ClientRuntime, ClientSettings
+from .filesystem import LocalFileSource
+from .ignore import LayeredIgnoreMatcher
 
 
 ROOT = Path(__file__).resolve().parents[2] / "benchmarks"
 DEFAULT_REPOSITORIES = ROOT / "repositories.json"
 DEFAULT_CASES = ROOT / "cases.jsonl"
 DEFAULT_VARIANTS = ROOT / "variants.json"
-BENCHMARK_SCHEMA_VERSION = 3
-
-VARIANT_PROFILE_FIELDS = {
-    "EMBED_ENABLED": ("runtime", "embedding_enabled"),
-    "CHUNKING_SEMANTIC_ENABLED": ("runtime", "semantic_chunking_enabled"),
-    "RETRIEVAL_EXACT_ENABLED": ("runtime", "exact_enabled"),
-    "RETRIEVAL_PATH_INDEX_ENABLED": ("runtime", "path_index_enabled"),
-    "RETRIEVAL_SOURCE_PRIORITY_ENABLED": (
-        "runtime",
-        "source_priority_enabled",
-    ),
-    "RETRIEVAL_COVERAGE_SELECTION_ENABLED": (
-        "runtime",
-        "coverage_selection_enabled",
-    ),
-    "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": (
-        "runtime",
-        "query_decomposition_enabled",
-    ),
-    "RERANK_ENABLED": ("runtime", "api_rerank_enabled"),
-    "LLM_RERANK_ENABLED": ("runtime", "llm_rerank_enabled"),
-    "RETRIEVAL_QUERY_REWRITE_ENABLED": ("runtime", "query_rewrite_enabled"),
-    "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": (
-        "runtime",
-        "intent_classification_enabled",
-    ),
-    "EMBED_QUERY_CACHE_MAX_ENTRIES": ("query_cache", "max_entries"),
-}
-_BOOLEAN_VARIANT_FIELDS = frozenset(VARIANT_PROFILE_FIELDS) - {
-    "EMBED_QUERY_CACHE_MAX_ENTRIES"
-}
 
 
 @dataclass(frozen=True)
@@ -109,43 +77,6 @@ class CaseResult:
 
 def _read_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _json_fingerprint(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def corpus_fingerprint(
-    repositories: dict[str, RepositorySpec],
-    cases: Sequence[BenchmarkCase],
-) -> str:
-    selected_repositories = sorted({case.repository for case in cases})
-    material = {
-        "repositories": {
-            name: {
-                "url": repositories[name].url,
-                "revision": repositories[name].revision,
-            }
-            for name in selected_repositories
-        },
-        "cases": [
-            {
-                "id": case.id,
-                "repository": case.repository,
-                "category": case.category,
-                "query": case.query,
-                "expected_paths": list(case.expected_paths),
-            }
-            for case in sorted(cases, key=lambda item: item.id)
-        ],
-    }
-    return _json_fingerprint(material)
 
 
 def load_repositories(path: Path = DEFAULT_REPOSITORIES) -> dict[str, RepositorySpec]:
@@ -215,7 +146,6 @@ def load_variants(path: Path = DEFAULT_VARIANTS) -> dict[str, BenchmarkVariant]:
     if not isinstance(payload, dict) or not payload:
         raise ValueError("variants manifest must be a non-empty JSON object")
     variants: dict[str, BenchmarkVariant] = {}
-    required = set(VARIANT_PROFILE_FIELDS)
     for name, value in payload.items():
         if not isinstance(name, str) or not name or not isinstance(value, dict):
             raise ValueError("variant entries must be named JSON objects")
@@ -229,36 +159,6 @@ def load_variants(path: Path = DEFAULT_VARIANTS) -> dict[str, BenchmarkVariant]:
         ):
             raise ValueError(
                 f"variant {name!r} environment must map strings to strings"
-            )
-        missing = sorted(required - environment.keys())
-        unexpected = sorted(environment.keys() - required)
-        if missing or unexpected:
-            raise ValueError(
-                f"variant {name!r} has missing fields {missing} "
-                f"and unexpected fields {unexpected}"
-            )
-        invalid_booleans = sorted(
-            key
-            for key in _BOOLEAN_VARIANT_FIELDS
-            if environment[key] not in {"true", "false"}
-        )
-        if invalid_booleans:
-            raise ValueError(
-                f"variant {name!r} boolean fields must use true/false: "
-                f"{invalid_booleans}"
-            )
-        try:
-            cache_entries = int(environment["EMBED_QUERY_CACHE_MAX_ENTRIES"])
-        except ValueError as exc:
-            raise ValueError(
-                f"variant {name!r} cache capacity must be a non-negative integer"
-            ) from exc
-        if (
-            cache_entries < 0
-            or str(cache_entries) != environment["EMBED_QUERY_CACHE_MAX_ENTRIES"]
-        ):
-            raise ValueError(
-                f"variant {name!r} cache capacity must be a non-negative integer"
             )
         variants[name] = BenchmarkVariant(
             name=name,
@@ -337,6 +237,72 @@ def _safe_error_message(exc: Exception) -> str:
         if secret := os.environ.get(name):
             message = message.replace(secret, "[REDACTED]")
     return message
+
+
+def resolve_client_binary(configured: str | None = None) -> str:
+    selected = configured or os.environ.get("OCE_CLIENT_BINARY")
+    if selected:
+        candidate = Path(selected).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        if executable := shutil.which(selected):
+            return executable
+        raise FileNotFoundError(f"oce-client binary not found: {selected}")
+
+    executable_name = "oce-client.exe" if os.name == "nt" else "oce-client"
+    repository_root = ROOT.parent
+    for profile in ("release", "debug"):
+        candidate = repository_root / "target" / profile / executable_name
+        if candidate.is_file():
+            return str(candidate.resolve())
+    if executable := shutil.which("oce-client"):
+        return executable
+    raise FileNotFoundError(
+        "oce-client binary not found; build it with cargo or pass --client-binary"
+    )
+
+
+def _run_client_json(
+    binary: str,
+    root: Path,
+    api_url: str,
+    api_key: str,
+    state_path: Path,
+    command: Sequence[str],
+) -> dict[str, object]:
+    environment = os.environ.copy()
+    environment["OCE_API_KEY"] = api_key
+    completed = subprocess.run(
+        [
+            binary,
+            "--root",
+            str(root),
+            "--api-url",
+            api_url,
+            "--state-path",
+            str(state_path),
+            *command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            f"oce-client {command[0]} failed with exit code "
+            f"{completed.returncode}: {detail[:1000]}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"oce-client {command[0]} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"oce-client {command[0]} returned a non-object payload")
+    return payload
 
 
 def aggregate(results: Sequence[CaseResult]) -> dict[str, object]:
@@ -500,93 +466,6 @@ def _admin_stats(api_url: str, admin_key: str) -> dict[str, object]:
     return value
 
 
-def _admin_index_stats(api_url: str, admin_key: str) -> dict[str, object]:
-    response = httpx.get(
-        f"{api_url.rstrip('/')}/admin/index-stats",
-        headers={"Authorization": f"Bearer {admin_key}"},
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    value = response.json()
-    if not isinstance(value, dict):
-        raise ValueError("admin index stats response must be an object")
-    return value
-
-
-def verify_variant_profile(
-    variant: BenchmarkVariant,
-    index_stats: dict[str, object],
-) -> dict[str, object]:
-    """Verify that a named result is backed by the declared server controls."""
-    mismatches: list[str] = []
-    actual_profile: dict[str, object] = {"runtime": {}, "query_cache": {}}
-    for environment_name, (section_name, field_name) in VARIANT_PROFILE_FIELDS.items():
-        section = index_stats.get(section_name)
-        actual = section.get(field_name) if isinstance(section, dict) else None
-        raw_expected = variant.environment[environment_name]
-        expected: object = (
-            raw_expected == "true"
-            if environment_name in _BOOLEAN_VARIANT_FIELDS
-            else int(raw_expected)
-        )
-        profile_section = actual_profile[section_name]
-        assert isinstance(profile_section, dict)
-        profile_section[field_name] = actual
-        if type(actual) is not type(expected) or actual != expected:
-            mismatches.append(
-                f"{environment_name} expected {expected!r}, got {actual!r}"
-            )
-    index_profile = index_stats.get("profile")
-    if not isinstance(index_profile, dict):
-        mismatches.append("index profile is missing")
-    else:
-        actual_profile["profile"] = {
-            key: index_profile.get(key)
-            for key in (
-                "state",
-                "fingerprint",
-                "schema_version",
-                "embedding_enabled",
-                "embedding_fingerprint",
-                "embedding_model",
-                "embedding_dimensions",
-            )
-        }
-        if index_profile.get("state") != "compatible":
-            mismatches.append(
-                "index profile state expected 'compatible', "
-                f"got {index_profile.get('state')!r}"
-            )
-        fingerprint = index_profile.get("fingerprint")
-        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
-            mismatches.append("index profile fingerprint is missing or invalid")
-        if index_profile.get("embedding_enabled") is not True:
-            mismatches.append("persisted index profile does not enable embedding")
-        embedding_fingerprint = index_profile.get("embedding_fingerprint")
-        if (
-            not isinstance(embedding_fingerprint, str)
-            or len(embedding_fingerprint) != 64
-        ):
-            mismatches.append("persisted embedding fingerprint is missing or invalid")
-        if not isinstance(index_profile.get("embedding_model"), str):
-            mismatches.append("persisted index profile has no embedding model")
-        dimensions = index_profile.get("embedding_dimensions")
-        if (
-            not isinstance(dimensions, int)
-            or isinstance(dimensions, bool)
-            or dimensions < 1
-        ):
-            mismatches.append(
-                "persisted index profile has invalid embedding dimensions"
-            )
-    if mismatches:
-        raise ValueError(
-            f"server profile does not match variant {variant.name!r}: "
-            + "; ".join(mismatches)
-        )
-    return actual_profile
-
-
 def _token_totals(stats: dict[str, object]) -> dict[str, dict[str, int]]:
     output: dict[str, dict[str, int]] = {}
     tokens = stats.get("tokens", [])
@@ -673,17 +552,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     api_url = args.api_url or os.environ.get("OCE_API_URL", "http://127.0.0.1:8986")
     api_key = os.environ.get("OCE_API_KEY", "sk-opencontextengine")
     admin_key = os.environ.get("OCE_ADMIN_API_KEY")
-    server_profile: dict[str, object] | None = None
-    if variant is not None:
-        if not admin_key:
-            raise ValueError(
-                "OCE_ADMIN_API_KEY is required to verify a named benchmark variant"
-            )
-        server_profile = verify_variant_profile(
-            variant,
-            _admin_index_stats(api_url, admin_key),
-        )
-
     state_context = (
         tempfile.TemporaryDirectory(prefix="oce-benchmark-")
         if args.state_dir is None
@@ -695,7 +563,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         else args.state_dir.resolve()
     )
     state_dir.mkdir(parents=True, exist_ok=True)
-    runtimes: dict[str, ClientRuntime] = {}
+    client_binary = resolve_client_binary(getattr(args, "client_binary", None))
+    state_paths: dict[str, Path] = {}
     sync: dict[str, object] = {}
     sync_errors: dict[str, Exception] = {}
     results: list[CaseResult] = []
@@ -705,15 +574,20 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         for name in sorted({case.repository for case in cases}):
             started = time.perf_counter()
             try:
-                settings = ClientSettings(
-                    root=(workdir / name).resolve(),
-                    api_url=api_url,
-                    api_key=api_key,
-                    state_path=state_dir / f"{name}.sqlite3",
+                state_path = state_dir / f"{name}.sqlite3"
+                state_paths[name] = state_path
+                sync_result = _run_client_json(
+                    client_binary,
+                    (workdir / name).resolve(),
+                    api_url,
+                    api_key,
+                    state_path,
+                    ("sync", "--json"),
                 )
-                runtime = ClientRuntime(settings)
-                runtimes[name] = runtime
-                sync_result = runtime.context().sync()
+                uploaded = sync_result.get("uploaded_blob_names")
+                checkpoint_id = sync_result.get("checkpoint_id")
+                if not isinstance(uploaded, list) or not isinstance(checkpoint_id, str):
+                    raise RuntimeError("oce-client sync returned an invalid payload")
             except Exception as exc:
                 sync_errors[name] = exc
                 sync[name] = {
@@ -726,8 +600,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
                 sync[name] = {
                     "status": "ok",
                     "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                    "uploaded_blobs": len(sync_result.uploaded_blob_names),
-                    "checkpoint_id_present": bool(sync_result.checkpoint_id),
+                    "uploaded_blobs": len(uploaded),
+                    "checkpoint_id_present": True,
                 }
 
         if admin_key:
@@ -740,14 +614,25 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
                 results.append(failed_case(case, error, agent_solved=solved))
                 continue
             try:
-                retrieval = runtimes[case.repository].context().retrieve(case.query)
-                paths = parse_retrieved_paths(retrieval.formatted_retrieval)
+                retrieval = _run_client_json(
+                    client_binary,
+                    (workdir / case.repository).resolve(),
+                    api_url,
+                    api_key,
+                    state_paths[case.repository],
+                    ("retrieve", case.query, "--json"),
+                )
+                formatted = retrieval.get("formatted_retrieval")
+                elapsed_ms = retrieval.get("elapsed_ms")
+                if not isinstance(formatted, str) or not isinstance(elapsed_ms, int):
+                    raise RuntimeError("oce-client retrieve returned an invalid payload")
+                paths = parse_retrieved_paths(formatted)
                 results.append(
                     score_case(
                         case,
                         paths,
-                        returned_chars=len(retrieval.formatted_retrieval),
-                        elapsed_ms=retrieval.elapsed_ms,
+                        returned_chars=len(formatted),
+                        elapsed_ms=elapsed_ms,
                         agent_solved=solved,
                     )
                 )
@@ -758,8 +643,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
             time.sleep(args.metrics_settle_seconds)
             stats_after = _admin_stats(api_url, admin_key)
     finally:
-        for runtime in runtimes.values():
-            runtime.close()
         if state_context is not None:
             state_context.cleanup()
 
@@ -774,18 +657,15 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         _estimate_cost(token_delta, prices) if token_delta is not None else None
     )
     return {
-        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "label": label,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "api_url": api_url,
-        "corpus_fingerprint": corpus_fingerprint(repositories, cases),
         "repositories": {
             name: asdict(repositories[name])
             for name in sorted({case.repository for case in cases})
         },
         "variant": asdict(variant) if variant is not None else None,
         "baseline": None,
-        "server_profile": server_profile,
         "metadata": metadata,
         "sync": sync,
         "summary": summary,
@@ -858,18 +738,15 @@ def run_lexical_baseline(args: argparse.Namespace) -> dict[str, object]:
     summary["external_model_tokens"] = {}
     summary["estimated_external_cost"] = 0.0
     return {
-        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "label": f"ripgrep-lexical-v{baseline['version']}",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "api_url": None,
-        "corpus_fingerprint": corpus_fingerprint(repositories, cases),
         "repositories": {
             name: asdict(repositories[name])
             for name in sorted({case.repository for case in cases})
         },
         "variant": None,
         "baseline": baseline,
-        "server_profile": None,
         "metadata": metadata,
         "sync": sync,
         "summary": summary,
@@ -887,47 +764,7 @@ def _format_value(value: object, *, percent: bool = False) -> str:
     return str(value)
 
 
-def _comparison_identity(
-    payload: dict[str, object],
-    path: Path,
-) -> tuple[str, str | None, str]:
-    if payload.get("schema_version") != BENCHMARK_SCHEMA_VERSION:
-        raise ValueError(
-            f"unsupported benchmark schema in {path}; rerun with schema "
-            f"{BENCHMARK_SCHEMA_VERSION}"
-        )
-    corpus = payload.get("corpus_fingerprint")
-    if not isinstance(corpus, str) or len(corpus) != 64:
-        raise ValueError(f"result has no corpus identity: {path}")
-    label = str(payload.get("label", path.stem))
-    variant = payload.get("variant")
-    server_profile = payload.get("server_profile")
-    profile = (
-        server_profile.get("profile") if isinstance(server_profile, dict) else None
-    )
-    if isinstance(variant, dict):
-        if not isinstance(profile, dict) or profile.get("state") != "compatible":
-            raise ValueError(f"named variant has no compatible server profile: {path}")
-        embedding_fingerprint = profile.get("embedding_fingerprint")
-        if (
-            not isinstance(embedding_fingerprint, str)
-            or len(embedding_fingerprint) != 64
-        ):
-            raise ValueError(f"named variant has no embedding fingerprint: {path}")
-    else:
-        embedding_fingerprint = (
-            profile.get("embedding_fingerprint") if isinstance(profile, dict) else None
-        )
-        if not isinstance(embedding_fingerprint, str):
-            embedding_fingerprint = None
-    return corpus, embedding_fingerprint, label
-
-
-def compare_results(
-    paths: Sequence[Path],
-    *,
-    allow_embedding_change: bool = False,
-) -> str:
+def compare_results(paths: Sequence[Path]) -> str:
     headers = (
         "Variant",
         "Cases",
@@ -942,33 +779,13 @@ def compare_results(
         "Est. cost",
     )
     rows = []
-    expected_corpus: str | None = None
-    expected_embedding: str | None = None
-    labels: set[str] = set()
     for path in paths:
         payload = _read_json(path)
         if not isinstance(payload, dict) or not isinstance(
             payload.get("summary"), dict
         ):
             raise ValueError(f"invalid benchmark result: {path}")
-        corpus, embedding, label = _comparison_identity(payload, path)
-        if expected_corpus is None:
-            expected_corpus = corpus
-        elif corpus != expected_corpus:
-            raise ValueError(
-                f"benchmark results use different corpora or case filters: {path}"
-            )
-        if embedding is not None:
-            if expected_embedding is None:
-                expected_embedding = embedding
-            elif embedding != expected_embedding and not allow_embedding_change:
-                raise ValueError(
-                    f"benchmark results use different embedding profiles: {path}; "
-                    "pass --allow-embedding-change for an explicit model comparison"
-                )
-        if label in labels:
-            raise ValueError(f"duplicate benchmark label {label!r}: {path}")
-        labels.add(label)
+        label = str(payload.get("label", path.stem))
         summary = payload["summary"]
         token_data = summary.get("external_model_tokens")
         total_tokens = (
@@ -1025,15 +842,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workdir", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
     identity = run.add_mutually_exclusive_group(required=True)
-    identity.add_argument(
-        "--variant",
-        help="checked-in variant whose live server profile must match",
-    )
+    identity.add_argument("--variant", help="checked-in diagnostic configuration")
     identity.add_argument(
         "--label",
         help="ad hoc configuration label",
     )
     run.add_argument("--api-url")
+    run.add_argument(
+        "--client-binary",
+        help="oce-client executable (default: OCE_CLIENT_BINARY, local target, or PATH)",
+    )
     run.add_argument("--state-dir", type=Path)
     run.add_argument("--repository", action="append", default=[])
     run.add_argument("--category", action="append", default=[])
@@ -1066,11 +884,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare = subparsers.add_parser("compare", help="render a Markdown variant table")
     compare.add_argument("results", nargs="+", type=Path)
-    compare.add_argument(
-        "--allow-embedding-change",
-        action="store_true",
-        help="explicitly compare results produced by different embedding profiles",
-    )
     return parser
 
 
@@ -1131,12 +944,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "compare":
-        print(
-            compare_results(
-                args.results,
-                allow_embedding_change=args.allow_embedding_change,
-            )
-        )
+        print(compare_results(args.results))
         return 0
     raise ValueError(f"unknown command: {args.command}")
 

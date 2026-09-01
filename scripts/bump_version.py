@@ -1,4 +1,4 @@
-"""Update the project version in all authoritative package metadata."""
+"""Update the Rust package version."""
 
 from __future__ import annotations
 
@@ -11,17 +11,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PYPROJECT = REPO_ROOT / "pyproject.toml"
-INIT_FILE = REPO_ROOT / "src/oce_client/__init__.py"
-LOCK_FILE = REPO_ROOT / "uv.lock"
-VERSION_FILES = [
-    "pyproject.toml",
-    "src/oce_client/__init__.py",
-    "uv.lock",
-]
+MANIFEST = REPO_ROOT / "Cargo.toml"
+VERSION_FILES = ["Cargo.toml", "Cargo.lock"]
 
-_PEP440_RE = re.compile(
-    r"^\d+(?:\.\d+)*(?:[ab]|rc)?\d*(?:\.post\d+)?(?:\.dev\d+)?$"
+_SEMVER_RE = re.compile(
+    r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 _PARTS = ("major", "minor", "patch")
 
@@ -34,11 +28,11 @@ def _stdout() -> None:
 
 
 def read_current_version() -> str:
-    with PYPROJECT.open("rb") as handle:
+    with MANIFEST.open("rb") as handle:
         data = tomllib.load(handle)
-    version = data.get("project", {}).get("version")
+    version = data.get("package", {}).get("version")
     if not isinstance(version, str) or not version:
-        raise SystemExit(f"ERROR: project.version is missing from {PYPROJECT}")
+        raise SystemExit(f"ERROR: package.version is missing from {MANIFEST}")
     return version
 
 
@@ -55,8 +49,8 @@ def resolve_version(value: str, current: str) -> str:
         else:
             parts[2] += 1
         return ".".join(str(part) for part in parts)
-    if not _PEP440_RE.fullmatch(value):
-        raise SystemExit(f"ERROR: {value!r} is not a supported PEP 440 version")
+    if not _SEMVER_RE.fullmatch(value):
+        raise SystemExit(f"ERROR: {value!r} is not a supported SemVer version")
     return value
 
 
@@ -74,42 +68,24 @@ def _replace_in_file(path: Path, pattern: re.Pattern[str], replacement: str) -> 
     path.write_text("".join(lines), encoding="utf-8")
 
 
-def update_pyproject(version: str) -> None:
+def update_manifest(version: str) -> None:
     _replace_in_file(
-        PYPROJECT,
+        MANIFEST,
         re.compile(r'^version\s*=\s*"[^"]*"'),
         f'version = "{version}"',
     )
 
 
-def update_init(version: str) -> None:
-    _replace_in_file(
-        INIT_FILE,
-        re.compile(r'^__version__\s*=\s*"[^"]*"'),
-        f'__version__ = "{version}"',
-    )
-
-
 def sync_lock() -> None:
-    subprocess.run(["uv", "lock"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["cargo", "check"], cwd=REPO_ROOT, check=True)
 
 
 def verify_sync() -> None:
-    init_text = INIT_FILE.read_text(encoding="utf-8")
-    match = re.search(r'^__version__\s*=\s*"([^"]*)"', init_text, re.MULTILINE)
-    init_version = match.group(1) if match else None
-    project_version = read_current_version()
-    if init_version != project_version:
-        raise SystemExit(
-            "ERROR: version mismatch: "
-            f"pyproject={project_version!r}, __init__={init_version!r}"
-        )
-    subprocess.run(["uv", "lock", "--check"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["cargo", "check", "--locked"], cwd=REPO_ROOT, check=True)
 
 
 def update_all(version: str) -> None:
-    update_pyproject(version)
-    update_init(version)
+    update_manifest(version)
     sync_lock()
     verify_sync()
 
@@ -129,7 +105,7 @@ def git_commit(version: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Update pyproject.toml, oce_client.__version__, and uv.lock"
+        description="Update Cargo.toml and Cargo.lock"
     )
     parser.add_argument("version_or_part", help="major, minor, patch, or an exact version")
     parser.add_argument("--commit", action="store_true", help="commit updated version files")

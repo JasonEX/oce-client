@@ -4,63 +4,106 @@ on:
   push:
     tags: ["v*.*.*"]
 
-permissions:
-  contents: read
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: release validation
-    runs-on: ubuntu-latest
+  validate:
+    name: validate tag
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.13"
-          enable-cache: true
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
 
-      - name: Install locked dependencies
-        run: uv sync --extra dev --extra mcp --locked
-
-      - name: Validate tag version
+      - name: Match tag and package version
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          project_version="$(uv run python -c 'from importlib.metadata import version; print(version("opencontextengine-client"))')"
-          if [[ "${project_version}" != "${tag_version}" ]]; then
-            echo "pyproject version ${project_version} does not match tag ${tag_version}"
-            exit 1
-          fi
+          package_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "$package_version" = "$tag_version"
 
-      - name: Run Ruff
-        run: uv run ruff check src tests benchmarks
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
 
-      - name: Run tests
-        run: uv run pytest -q
-
-  python-package:
-    name: publish Python package
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+  build:
+    name: build (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v5
+      - name: Install Rust 1.88
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.88.0
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          asset="oce-client-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          mkdir package
+          cp "target/${{ matrix.target }}/release/oce-client" package/
+          cp LICENSE README.md package/
+          tar -czf "$asset" -C package .
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "oce-client-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory package | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/oce-client.exe" package/
+          Copy-Item LICENSE, README.md package/
+          Compress-Archive -Path package/* -DestinationPath $asset
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v7
         with:
-          python-version: "3.13"
-          enable-cache: true
+          path: ${{ env.ASSET }}
+          archive: false
+          if-no-files-found: error
 
-      - name: Build sdist and wheel
-        run: uv build
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --title "$GITHUB_REF_NAME" --generate-notes

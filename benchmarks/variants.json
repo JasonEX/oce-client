@@ -151,5 +151,22 @@
       "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
       "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
     }
+  },
+  "full-no-rerank-intent": {
+    "description": "Full deterministic hybrid retrieval with intent classification and without model reranking.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "true",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "true",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "true",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
   }
 }

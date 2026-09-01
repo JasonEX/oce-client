@@ -1,0 +1,51 @@
+[package]
+name = "oce-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Standalone workspace synchronization and MCP client for OpenContextEngine"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/JasonEX/oce-client"
+keywords = ["code", "retrieval", "mcp"]
+publish = false
+
+[lib]
+path = "rust/src/lib.rs"
+
+[[bin]]
+name = "oce-client"
+path = "rust/src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+ignore = "0.4.33"
+notify = "8.2.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.dev]
+debug = 0
+incremental = false
+strip = "debuginfo"
+
+[profile.test]
+debug = 0
+incremental = false
+strip = "debuginfo"
+
+[profile.release]
+codegen-units = 1
+debug = 0
+incremental = false
+lto = "thin"
+panic = "abort"
+strip = "symbols"

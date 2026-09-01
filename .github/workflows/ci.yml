@@ -15,74 +15,49 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        os: [ubuntu-24.04, windows-2025, macos-15-intel, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          enable-cache: true
-
-      - name: Install locked dependencies
-        run: uv sync --extra dev --extra mcp --locked
-
-      - name: Smoke import
-        run: uv run python -c "import oce_client; from oce_client.mcp_server import create_server; print(oce_client.__version__)"
-
-      - name: Run Ruff
-        if: matrix.python-version == '3.13'
-        run: uv run ruff check src tests benchmarks
-
-      - name: Run tests
-        run: uv run pytest -q
-
-  build:
-    name: build (packaging)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.13"
-          enable-cache: true
-
-      - name: Build sdist and wheel
-        run: uv build
-
-      - name: Validate bundled skill
+      - name: Install Rust 1.88
         shell: bash
         run: |
-          python - <<'PY'
-          import glob
-          import zipfile
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
 
-          wheel = glob.glob("dist/*.whl")
-          if len(wheel) != 1:
-              raise SystemExit(f"expected one wheel, found: {wheel}")
-          with zipfile.ZipFile(wheel[0]) as archive:
-              names = set(archive.namelist())
-          required = {
-              "oce_client/skill/SKILL.md",
-              "oce_client/skill/agents/openai.yaml",
-          }
-          missing = required - names
-          if missing:
-              raise SystemExit(f"wheel is missing bundled skill files: {sorted(missing)}")
-          PY
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
 
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+      - name: Run Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --all-targets --locked
+
+  benchmark-tooling:
+    name: benchmark tooling
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v9
         with:
-          name: dist
-          path: dist/*
-          if-no-files-found: error
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Install locked development dependencies
+        run: uv sync --locked
+
+      - name: Check benchmark tooling
+        run: uv run ruff check benchmarks tests/test_benchmark.py
+
+      - name: Run benchmark-tooling tests
+        run: uv run pytest -q tests/test_benchmark.py

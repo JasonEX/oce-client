@@ -1,24 +1,19 @@
 # OCE retrieval benchmark
 
-This source-backed harness evaluates OCE through the same workspace sync and retrieval path
-used by `oce-client`; it does not maintain a second uploader or bypass checkpoint semantics.
+This source-backed harness invokes the Rust `oce-client` binary for workspace sync and
+retrieval; it does not maintain a second uploader or bypass checkpoint semantics.
 It also includes a deterministic no-model ripgrep baseline over the same admitted files.
 The checked-in corpus contains 50 queries across pinned public revisions of `oce` and
 `oce-client`, covering symbol definition, feature location, cross-file flow, architecture,
 configuration, references, and bug localization.
 
-`variants.json` defines cumulative ablations from recursive dense retrieval through hybrid
-recall, selection, and model reranking. A named run is accepted only when the server's
-authenticated `/admin/index-stats` runtime profile matches every declared switch. This
-prevents a result label from silently describing a configuration that was not running.
-The same preflight requires a compatible persisted index fingerprint and records the
-resolved embedding model and dimensions reported by the server.
+`variants.json` lists cumulative ablations from recursive dense retrieval through hybrid
+recall, selection, and model reranking. These are diagnostic labels and environment recipes;
+the harness does not enforce server configuration.
 
 The harness reports Top-1, Recall@10, MRR, nDCG@10, returned characters, and end-to-end
 latency. Workspace-sync and query errors remain in the raw result and score as zero rather
-than disappearing. Each result records a corpus identity derived from the selected pinned
-repositories, queries, and expected paths so accidental case-filter mismatches are not
-combined.
+than disappearing. Each result includes its selected repository revisions and cases.
 When `OCE_ADMIN_API_KEY` is available on an isolated benchmark server, it also records the
 delta in external model calls and tokens after excluding workspace indexing. Optional
 per-kind prices convert that delta into an explicit cost estimate. Agent task outcomes are
@@ -30,6 +25,7 @@ automatic task-success claim.
 From the `oce-client` repository:
 
 ```bash
+cargo build --release --locked
 uv run python benchmarks/evaluate.py validate
 uv run python benchmarks/evaluate.py variants
 uv run python benchmarks/evaluate.py prepare --workdir /tmp/oce-benchmark-workspaces
@@ -49,11 +45,10 @@ uv run python benchmarks/evaluate.py baseline \
 ```
 
 This command requires `rg` but no OCE server, API key, embedding model, or LLM. It reuses
-`LocalFileSource` and `LayeredIgnoreMatcher`, so size, UTF-8, binary, ignore,
-sensitive-file, and symlink-containment behavior stays aligned with the client. Ripgrep
-searches only the admitted file list; fixed lexical rules rank matches and pack at most ten
-bounded 1,600-character excerpts. The result records the algorithm and ripgrep versions,
-and reports zero external model tokens and cost.
+the benchmark's conservative file admission rules. Ripgrep searches only that admitted
+file list; fixed lexical rules rank matches and pack at most ten bounded 1,600-character
+excerpts. The result records the algorithm and ripgrep versions, and reports zero external
+model tokens and cost.
 
 This is an automated lexical lower bound, not a simulation of Codex choosing searches,
 reading files, and reasoning across several rounds. `Agent solved` therefore remains unset;
@@ -77,21 +72,21 @@ Then run the named variant:
 ```bash
 export OCE_API_URL=http://127.0.0.1:8986
 export OCE_API_KEY=sk-opencontextengine
+# Optional, only for model-call and token accounting:
 export OCE_ADMIN_API_KEY=sk-admin
 
 uv run python benchmarks/evaluate.py run \
   --workdir /tmp/oce-benchmark-workspaces \
+  --client-binary target/release/oce-client \
   --variant dense-exact-path \
   --metadata embedding=Qwen3-Embedding-4B \
   --output /tmp/oce-results/dense-exact-path.json
 ```
 
-`OCE_ADMIN_API_KEY` is mandatory for named variants: the harness checks the live embedding,
-chunking, recall, priority, selector, rerank, rewrite, intent, decomposition, and query-cache
-settings before any workspace sync. It also requires the server's persisted index profile
-to be compatible, fingerprinted, and backed by a resolved embedding model/dimension. The
-checked-in variants disable the query-vector cache so one run cannot benefit from warm
-queries left by another.
+The harness records the selected variant recipe but does not inspect or reject the running
+server configuration. Apply the recipe to an isolated server yourself when comparability
+matters. `OCE_ADMIN_API_KEY` is optional and is used only to record model-call and token
+deltas.
 
 The default six-second settling interval allows the asynchronous metrics buffer to flush
 before snapshots. Pass prices in USD per million tokens when a cost estimate is wanted:
@@ -107,8 +102,7 @@ uv run python benchmarks/evaluate.py run \
 ```
 
 `--label NAME` remains available for exploratory configurations that are not in
-`variants.json`. Such runs skip the named-variant configuration check and record
-`variant: null`; document the relevant server environment in `--metadata`.
+`variants.json`; document relevant server settings in `--metadata`.
 
 To attach agent-task evidence, provide a JSON object mapping case IDs to booleans:
 
@@ -143,10 +137,9 @@ paths, retrieved paths, metrics, and errors, but never stores returned source-co
 API keys.
 
 `compare` accepts named variants, ad hoc `--label` runs, and the lexical baseline directly.
-It rejects different case filters/corpora, duplicate labels, old result schemas, and
-different embedding fingerprints. These are experiment-confound checks, not a security or
-result-integrity mechanism. For an intentional model comparison, pass
-`--allow-embedding-change`. Corpus mismatches are never combined into one table.
+It renders the supplied summaries without deciding whether the runs are comparable; use
+the repository revisions, selected cases, and metadata stored in each result when drawing
+conclusions.
 
 The corpus is a checked-in starting point, not a claim that 50 cases cover every repository
 shape. Add cases from real coding work with reviewed path labels, keep failures, and compare

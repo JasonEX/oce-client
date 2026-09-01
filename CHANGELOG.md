@@ -8,9 +8,8 @@ Entries are generated from Conventional Commits.
 ### Added
 
 - **benchmark**: add a pinned 50-case retrieval, cost, and agent-outcome evaluation harness
-- **benchmark**: verify checked-in ablation variants against the live server runtime profile
-- **benchmark**: require a compatible persisted index fingerprint and record the resolved embedding model
-- **benchmark**: record corpus identity and reject comparisons across different case sets, repository revisions, or embedding profiles
+- **benchmark**: add diagnostic retrieval recipes, including an intent-classifier A/B pair
+- **release**: build native client archives for Linux, Windows, and macOS
 
 ### Fixed
 
@@ -19,6 +18,7 @@ Entries are generated from Conventional Commits.
 
 ### Changed
 
+- **client**: replace the Python runtime and separate MCP entry point with one Rust binary
 - **mcp**: describe semantic retrieval as broad discovery whose results require verification
 
 ## [0.1.0] - 2026-08-30

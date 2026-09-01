@@ -1,4 +1,4 @@
-from oce_client.benchmark import main
+from oce_benchmark.benchmark import main
 
 
 if __name__ == "__main__":
