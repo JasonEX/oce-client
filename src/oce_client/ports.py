@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-from collections.abc import Callable
 from typing import Protocol, Sequence
 
 from .models import (
@@ -41,30 +39,3 @@ class BlobApi(Protocol):
         added_blobs: Sequence[str],
         deleted_blobs: Sequence[str],
     ) -> RetrievalResult: ...
-
-
-class StateStore(Protocol):
-    def load_snapshot(self): ...
-
-
-class WatchHandle(Protocol):
-    @property
-    def error(self) -> str | None: ...
-
-    def stop(self) -> None: ...
-
-    def join(self, timeout: float | None = None) -> None: ...
-
-
-class FileSource(Protocol):
-    def scan(self, root: Path, matcher: IgnoreMatcher) -> dict[str, str]: ...
-
-    def read(self, path: Path) -> str: ...
-
-
-class IgnoreMatcher(Protocol):
-    def ignores(self, path: str, *, is_dir: bool = False) -> bool: ...
-
-
-class Watcher(Protocol):
-    def start(self, callback: Callable[[], None]) -> WatchHandle: ...

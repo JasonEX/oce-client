@@ -31,10 +31,6 @@ from .models import (
 from .ports import (
     BlobApi as BlobApi,
     BlobIdentity as BlobIdentity,
-    FileSource as FileSource,
-    IgnoreMatcher as IgnoreMatcher,
-    StateStore as StateStore,
-    Watcher as Watcher,
 )
 from .runtime import (
     ClientConfigurationError as ClientConfigurationError,
