@@ -37,6 +37,10 @@ jobs:
       - name: Smoke import
         run: uv run python -c "import oce_client; from oce_client.mcp_server import create_server; print(oce_client.__version__)"
 
+      - name: Run Ruff
+        if: matrix.python-version == '3.13'
+        run: uv run ruff check src tests benchmarks
+
       - name: Run tests
         run: uv run pytest -q
 

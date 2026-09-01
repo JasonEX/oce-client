@@ -32,6 +32,7 @@ Issues = "https://github.com/oce-ai/oce-client/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "ruff==0.14.2",
 ]
 mcp = [
     "mcp>=1.0.0,<2",
