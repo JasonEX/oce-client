@@ -77,6 +77,17 @@ class CountingFileSource(LocalFileSource):
         return super().read(path)
 
 
+class FailingReadSource(LocalFileSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def read(self, path: Path) -> str:
+        if self.fail:
+            raise OSError("file changed during scan")
+        return super().read(path)
+
+
 def test_hash_matches_oce_contract():
     assert Sha256BlobIdentity().calculate("src/main.py", "print(1)") == (
         "69077264fad0c3c3321a9a1c36b0595f6c8c362e1d9529ac6f17431c753edfff"
@@ -190,6 +201,34 @@ def test_incremental_sync_does_not_reread_unchanged_files(tmp_path: Path):
         assert restarted_source.read_paths == []
     finally:
         restarted.close()
+
+
+def test_full_sync_removes_file_that_becomes_unreadable_after_enumeration(
+    tmp_path: Path,
+):
+    path = tmp_path / "changing.py"
+    path.write_text("public", encoding="utf-8")
+    source = FailingReadSource()
+    api = FakeApi()
+    context = WorkspaceContext.open(
+        tmp_path,
+        api,
+        file_source=source,
+        ready_poll_attempts=1,
+    )
+    try:
+        first = context.sync()
+        original_blob = first.added_blobs[0]
+        path.write_text("changed and now unreadable", encoding="utf-8")
+        source.fail = True
+
+        second = context.sync()
+
+        assert second.deleted_blobs == (original_blob,)
+        assert original_blob not in api.checkpoint_members
+        assert "changing.py" not in context.snapshot().files
+    finally:
+        context.close()
 
 
 def test_incremental_sync_removes_file_replaced_by_outside_symlink(tmp_path: Path):

@@ -177,7 +177,6 @@ class WorkspaceContext:
 
         for path, source_path, stat in self.file_source.iter_files(self.root, matcher):
             scanned_paths.add(path)
-            known_paths.add(path)
             existing = current.files.get(path)
             if (
                 existing is not None
@@ -187,6 +186,7 @@ class WorkspaceContext:
                 and existing.mtime_ns == stat.st_mtime_ns
                 and existing.size == stat.st_size
             ):
+                known_paths.add(path)
                 records.append(
                     FileRecord(
                         path,
@@ -213,7 +213,9 @@ class WorkspaceContext:
                 records.append(overlay)
                 if len(records) >= 256:
                     flush_records()
+                known_paths.add(path)
                 continue
+            known_paths.add(path)
             records.append(
                 FileRecord(
                     path,
