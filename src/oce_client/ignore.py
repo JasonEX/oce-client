@@ -25,6 +25,32 @@ DEFAULT_PATTERNS = (
 )
 
 
+SENSITIVE_PATTERNS = (
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "!.env.*.example",
+    "!.env.sample",
+    "!.env.*.sample",
+    "!.env.template",
+    "!.env.*.template",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_ed25519",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".aws/",
+    ".aws/**",
+    ".ssh/",
+    ".ssh/**",
+)
+
+
 class _RuleLayer:
     def __init__(self, lines: Iterable[str]) -> None:
         cleaned = []
@@ -57,7 +83,15 @@ class LayeredIgnoreMatcher:
         gitignore_name: str = ".gitignore",
     ) -> None:
         self.root = root
-        self._hard = _RuleLayer((".git/", ".git/**", ".oce-client/", ".oce-client/**"))
+        self._hard = _RuleLayer(
+            (
+                ".git/",
+                ".git/**",
+                ".oce-client/",
+                ".oce-client/**",
+                *SENSITIVE_PATTERNS,
+            )
+        )
         self._runtime = _RuleLayer(runtime_patterns)
         self._oce = _RuleLayer(self._read_lines(root / oceignore_name))
         self._git = _RuleLayer(self._read_lines(root / gitignore_name))
@@ -75,7 +109,7 @@ class LayeredIgnoreMatcher:
         while normalized.startswith("./"):
             normalized = normalized[2:]
         # A hard rule cannot be undone by a higher-priority negation.
-        if self._hard.match(normalized, is_dir) is True:
+        if self._hard.match(normalized.casefold(), is_dir) is True:
             return True
         for layer in (self._runtime, self._oce, self._git, self._defaults):
             decision = layer.match(normalized, is_dir)

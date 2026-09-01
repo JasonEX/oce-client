@@ -157,6 +157,43 @@ def test_mcp_returns_indexing_when_initial_sync_exceeds_timeout(tmp_path: Path):
         _stop(server)
 
 
+def test_mcp_reports_watcher_failure_instead_of_ready(tmp_path: Path, monkeypatch):
+    import oce_client.indexer as indexer_module
+
+    calls: list[str] = []
+
+    class FailedWatch:
+        error = "filesystem watcher failed: test failure"
+
+        def __init__(self, root, callback, debounce_ms, on_error=None):
+            pass
+
+        def stop(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(indexer_module, "WatchHandle", FailedWatch)
+
+    def factory(settings: ClientSettings) -> FakeRuntime:
+        return FakeRuntime(settings, calls)
+
+    server = create_server(
+        ClientSettings(tmp_path, "http://oce.test", "test-key"),
+        initial_sync="off",
+        ready_timeout=1,
+        runtime_factory=factory,
+    )
+    try:
+        result = _call(server, "codebase-retrieval", {"information_request": "find x"})
+        assert result["status"] == "error"
+        assert result["error"] == FailedWatch.error
+        assert "formatted_retrieval" not in result
+    finally:
+        _stop(server)
+
+
 def test_mcp_recovers_with_full_sync_after_incremental_failure(tmp_path: Path):
     calls: list[str] = []
 

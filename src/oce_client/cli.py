@@ -233,6 +233,8 @@ def _run(args: argparse.Namespace) -> int:
             except KeyboardInterrupt:
                 handle.stop()
                 handle.join(2.0)
+            if handle.error is not None:
+                raise OSError(handle.error)
             return 0
     raise ValueError(f"unknown command: {args.command}")
 

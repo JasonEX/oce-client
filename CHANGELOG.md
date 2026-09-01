@@ -5,6 +5,15 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+### Fixed
+
+- **admission**: exclude common secret files and symbolic links from workspace uploads
+- **watch**: report filesystem watcher failures instead of silently continuing
+
+### Changed
+
+- **mcp**: describe semantic retrieval as broad discovery whose results require verification
+
 ## [0.1.0] - 2026-08-30
 
 ### Added

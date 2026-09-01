@@ -20,12 +20,11 @@ from .runtime import (
 )
 
 
-TOOL_DESCRIPTION = """This tool is Open Context Engine(oce), Open source codebase context engine. It:
-1. Takes in a natural language description of the code you are looking for;
-2. Uses a proprietary retrieval/embedding model suite that produces the highest-quality recall of relevant code snippets from across the codebase;
-3. Maintains a real-time index of the codebase, so the results are always up-to-date and reflects the current state of the codebase;
-4. Can retrieve across different programming languages;
-5. Only reflects the current state of the codebase on the disk, and has no information on version control or code history."""
+TOOL_DESCRIPTION = """Retrieve semantically relevant code sections from an indexed workspace.
+Use this for broad architectural, behavioral, cross-language, or unknown-location searches.
+For known filenames or exact identifiers, native filesystem or text search may be faster.
+Results are retrieval candidates and should be verified before editing.
+The index reflects files currently on disk and contains no version-control history."""
 
 
 def _require_sdk() -> Any:

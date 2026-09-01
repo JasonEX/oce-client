@@ -54,7 +54,12 @@ class WorkspaceIndexer:
                     self._request_full_locked()
                 return
             self._started = True
-            self._watch = WatchHandle(self.root, self.notify_changes, self.debounce_ms)
+            self._watch = WatchHandle(
+                self.root,
+                self.notify_changes,
+                self.debounce_ms,
+                on_error=self._notify_watch_error,
+            )
             self._worker = threading.Thread(
                 target=self._run,
                 name=f"oce-indexer-{self.root.name}",
@@ -91,6 +96,13 @@ class WorkspaceIndexer:
         self._state = "indexing"
         self._last_error = None
         self._condition.notify_all()
+
+    def _notify_watch_error(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def _watch_error_locked(self) -> str | None:
+        return self._watch.error if self._watch is not None else None
 
     def request_full_sync(self) -> None:
         with self._condition:
@@ -179,6 +191,7 @@ class WorkspaceIndexer:
         return (
             self._initialized
             and self._state == "ready"
+            and self._watch_error_locked() is None
             and not self._full_pending
             and not self._pending_paths
             and self._synced_generation >= self._requested_generation
@@ -196,6 +209,8 @@ class WorkspaceIndexer:
             ):
                 self._request_full_locked()
             while not self._ready_locked():
+                if self._watch_error_locked() is not None:
+                    return "error"
                 if (
                     self._state == "error"
                     and not self._full_pending
@@ -215,6 +230,7 @@ class WorkspaceIndexer:
         with self._condition:
             if (
                 self._state == "error"
+                and self._watch_error_locked() is None
                 and not self._full_pending
                 and not self._pending_paths
             ):
@@ -230,7 +246,11 @@ class WorkspaceIndexer:
                         "workspace_folder": str(self.root),
                     }
                     if status == "error":
-                        payload["error"] = self._last_error or "workspace synchronization failed"
+                        payload["error"] = (
+                            self._watch_error_locked()
+                            or self._last_error
+                            or "workspace synchronization failed"
+                        )
                     else:
                         payload["message"] = "Workspace indexing is still in progress; retry shortly."
                     return payload
@@ -256,10 +276,11 @@ class WorkspaceIndexer:
 
     def status(self) -> dict[str, object]:
         with self._condition:
+            watch_error = self._watch_error_locked()
             return {
-                "status": self._state,
+                "status": "error" if watch_error is not None else self._state,
                 "workspace_folder": str(self.root),
                 "requested_generation": self._requested_generation,
                 "synced_generation": self._synced_generation,
-                "error": self._last_error,
+                "error": watch_error or self._last_error,
             }

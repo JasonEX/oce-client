@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from oce_client.cli import build_parser, main
+from oce_client.context import WorkspaceContext
 from oce_client.runtime import DEFAULT_API_KEY, DEFAULT_API_URL, ClientSettings
 
 
@@ -55,6 +56,26 @@ def test_environment_values_are_used(tmp_path: Path, monkeypatch, capsys):
 def test_mcp_is_not_a_cli_subcommand():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["mcp"])
+
+
+def test_watch_failure_returns_nonzero(tmp_path: Path, monkeypatch, capsys):
+    class FailedHandle:
+        error = "filesystem watcher failed: test failure"
+
+        def join(self, timeout=None):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        WorkspaceContext,
+        "start_watching",
+        lambda self, *, debounce_ms: FailedHandle(),
+    )
+
+    assert main(["--root", str(tmp_path), "watch"]) == 1
+    assert FailedHandle.error in capsys.readouterr().err
 
 
 def test_skill_can_be_located_and_installed(tmp_path: Path, capsys):

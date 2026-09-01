@@ -48,6 +48,9 @@ class StateStore(Protocol):
 
 
 class WatchHandle(Protocol):
+    @property
+    def error(self) -> str | None: ...
+
     def stop(self) -> None: ...
 
     def join(self, timeout: float | None = None) -> None: ...

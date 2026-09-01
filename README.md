@@ -85,6 +85,10 @@ index in the background, watches the filesystem, and synchronizes only changed
 paths. Unchanged files are identified by stored filesystem metadata and are not
 read or rehashed on restart.
 
+Use the tool for broad semantic, architectural, cross-language, or unknown-location
+searches. For a known filename or exact identifier, native filesystem or text search is
+usually more direct. Verify retrieved candidates against the current files before editing.
+
 Declare each allowed workspace with a repeated `--workspace` argument. With one
 workspace, the tool's `workspace_folder` input is optional. With multiple
 workspaces it is required and must exactly match an allowed path. Other paths
@@ -106,7 +110,8 @@ oce-client-mcp `
 defers initialization until the first retrieval call. A tool call waits up to
 `--ready-timeout` seconds for the latest observed filesystem generation. Its
 result status is `ready`, `indexing`, or `error`; only a `ready` result contains
-retrieval context. `OCE_API_URL`, `OCE_API_KEY`, `OCE_STATE_PATH`, `OCE_STATE_DIR`, `OCE_IGNORE`,
+retrieval context. A watcher failure is reported as `error`, so the MCP tool does
+not present a stale index as current. `OCE_API_URL`, `OCE_API_KEY`, `OCE_STATE_PATH`, `OCE_STATE_DIR`, `OCE_IGNORE`,
 `OCE_DEBOUNCE_MS`, `OCE_INITIAL_SYNC`, `OCE_READY_TIMEOUT`, and
 `OCE_LOG_LEVEL` provide environment equivalents. `--state-path` and
 `OCE_STATE_PATH` are for one workspace; use `--state-dir` or `OCE_STATE_DIR`
@@ -131,3 +136,12 @@ pass `--force` only when intentionally updating one.
 
 Keep `OCE_API_KEY` in the host's environment or secret manager; do not commit it
 to an MCP configuration file.
+
+Workspace admission follows `.gitignore`, `.oceignore`, runtime ignore patterns,
+and built-in dependency exclusions. Common secret files (`.env`, private keys,
+credential dotfiles, and SSH/AWS directories) are always excluded and cannot be
+re-included by a negated ignore rule; safe templates such as `.env.example` remain
+available. Symbolic links are not read or uploaded, including links that point
+outside the workspace. Other admitted source files are uploaded to the configured OCE
+service and may then be sent to its embedding or LLM providers. Add project-specific
+secret or data paths to `.oceignore` before the first sync.

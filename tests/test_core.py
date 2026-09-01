@@ -89,6 +89,41 @@ def test_ignore_layers_and_negation(tmp_path: Path):
     assert matcher.ignores(".git/config")
 
 
+def test_sensitive_files_cannot_be_reincluded(tmp_path: Path):
+    (tmp_path / ".oceignore").write_text(
+        "!.env\n!private.pem\n!.ssh/config\n", encoding="utf-8"
+    )
+    matcher = LayeredIgnoreMatcher(tmp_path)
+
+    assert matcher.ignores(".env")
+    assert matcher.ignores("config/.env.local")
+    assert matcher.ignores("private.pem")
+    assert matcher.ignores("PRIVATE.PEM")
+    assert matcher.ignores(".ssh/config")
+    assert not matcher.ignores(".env.example")
+    assert not matcher.ignores("config/.env.production.example")
+    assert not matcher.ignores("src/credentials.py")
+
+
+def test_file_source_rejects_symbolic_links(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    link = workspace / "linked.py"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+    source = LocalFileSource()
+    matcher = LayeredIgnoreMatcher(workspace)
+
+    assert source.scan(workspace, matcher) == {}
+    with pytest.raises(ValueError, match="symbolic links are not supported"):
+        source.read(link)
+
+
 def test_sync_add_modify_delete_and_restore(tmp_path: Path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("one", encoding="utf-8")
@@ -98,7 +133,7 @@ def test_sync_add_modify_delete_and_restore(tmp_path: Path):
         first = context.sync()
         assert first.checkpoint_id == "chain:1"
         old_name = first.added_blobs[0]
-        (tmp_path / "src" / "main.py").write_text("two", encoding="utf-8")
+        (tmp_path / "src" / "main.py").write_text("two changed", encoding="utf-8")
         second = context.sync()
         assert old_name in second.deleted_blobs
         assert len(second.added_blobs) == 1
@@ -173,7 +208,7 @@ def test_service_hash_mismatch_is_rejected(tmp_path: Path):
     original = api.batch_upload
 
     def bad_upload(blobs):
-        result = original(blobs)
+        original(blobs)
         return UploadResult(("0" * 64,))
 
     api.batch_upload = bad_upload

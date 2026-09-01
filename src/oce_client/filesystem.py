@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat as stat_module
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -27,19 +28,31 @@ class LocalFileSource:
             for name in dirnames:
                 path = directory_path / name
                 relative = path.relative_to(root).as_posix()
-                if not matcher.ignores(relative, is_dir=True):
-                    kept_dirs.append(name)
+                if path.is_symlink() or matcher.ignores(relative, is_dir=True):
+                    continue
+                try:
+                    path.resolve(strict=True).relative_to(root)
+                except (OSError, ValueError):
+                    continue
+                kept_dirs.append(name)
             dirnames[:] = kept_dirs
             for name in filenames:
                 path = directory_path / name
                 try:
                     relative = path.relative_to(root).as_posix()
-                    stat = path.stat()
+                    file_stat = path.lstat()
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
                 except (OSError, ValueError):
                     continue
-                if matcher.ignores(relative) or stat.st_size > self.max_file_size:
+                if (
+                    stat_module.S_ISLNK(file_stat.st_mode)
+                    or not stat_module.S_ISREG(file_stat.st_mode)
+                    or matcher.ignores(relative)
+                    or file_stat.st_size > self.max_file_size
+                ):
                     continue
-                yield relative, path, stat
+                yield relative, path, file_stat
 
     def scan(self, root: Path, matcher: LayeredIgnoreMatcher) -> dict[str, str]:
         files: dict[str, str] = {}
@@ -51,6 +64,8 @@ class LocalFileSource:
         return files
 
     def read(self, path: Path) -> str:
+        if path.is_symlink():
+            raise FileAdmissionError(f"symbolic links are not supported: {path}")
         data = path.read_bytes()
         if len(data) > self.max_file_size:
             raise FileAdmissionError(f"file exceeds {self.max_file_size} bytes: {path}")
