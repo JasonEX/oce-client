@@ -80,7 +80,11 @@ class WorkspaceContext:
         root_path = Path(root).resolve()
         if not root_path.is_dir():
             raise NotADirectoryError(root_path)
-        db_path = Path(state_path) if state_path else root_path / ".oce-client" / "state.sqlite3"
+        db_path = (
+            Path(state_path)
+            if state_path
+            else root_path / ".oce-client" / "state.sqlite3"
+        )
         return cls(
             root_path,
             api,
@@ -128,7 +132,9 @@ class WorkspaceContext:
         if not isinstance(content, str):
             raise TypeError("content must be text")
         if len(content.encode("utf-8")) > self.file_source.max_file_size:
-            raise FileAdmissionError(f"file exceeds {self.file_source.max_file_size} bytes")
+            raise FileAdmissionError(
+                f"file exceeds {self.file_source.max_file_size} bytes"
+            )
         if "\x00" in content:
             raise FileAdmissionError("binary content is not supported")
         generation = self._next_generation()
@@ -230,11 +236,17 @@ class WorkspaceContext:
                     flush_records()
         flush_records()
         self.state.set_meta("generation", str(generation))
-        missing_paths = [path for path in current.files if path not in known_paths and path not in explicit]
+        missing_paths = [
+            path
+            for path in current.files
+            if path not in known_paths and path not in explicit
+        ]
         self.state.mark_missing_paths(missing_paths, generation)
         return self.state.load_snapshot()
 
-    def reconcile_paths(self, changed_paths: Iterable[str | os.PathLike[str]]) -> WorkspaceSnapshot:
+    def reconcile_paths(
+        self, changed_paths: Iterable[str | os.PathLike[str]]
+    ) -> WorkspaceSnapshot:
         resolved_paths: set[Path] = set()
         for path in changed_paths:
             candidate = Path(path)
@@ -284,9 +296,7 @@ class WorkspaceContext:
                 or matcher.ignores(relative)
             ):
                 deleted.update(
-                    path
-                    for path in tracked
-                    if current.files[path].source != "explicit"
+                    path for path in tracked if current.files[path].source != "explicit"
                 )
                 continue
             try:
@@ -396,10 +406,13 @@ class WorkspaceContext:
                 if row["status"] == FileStatus.PRESENT.value and row["blob_name"]
             }
             current_names = tuple(sorted(current_records))
+            checkpoint_id = plan.delta.checkpoint_id
+            if checkpoint_id is not None:
+                status = self.api.blob_status((), checkpoint_id)
+                if status.checkpoint_not_found:
+                    checkpoint_id = None
             names_to_check = (
-                current_names
-                if plan.delta.checkpoint_id is None
-                else plan.delta.added_blobs
+                current_names if checkpoint_id is None else plan.delta.added_blobs
             )
             unknown: set[str] = set()
             nonindexed: set[str] = set()
@@ -416,7 +429,9 @@ class WorkspaceContext:
             for name in sorted(to_upload):
                 record = current_records.get(name)
                 if record is None:
-                    raise BlobCompatibilityError(f"missing local record for blob {name}")
+                    raise BlobCompatibilityError(
+                        f"missing local record for blob {name}"
+                    )
                 path = str(record["path"])
                 content = self.state.load_file_content(path)
                 if content is None:
@@ -425,7 +440,9 @@ class WorkspaceContext:
                 if actual_name != name:
                     raise BlobCompatibilityError(f"file changed during sync: {path}")
                 upload = BlobUpload(path, content, name)
-                upload_bytes = len(upload.path.encode("utf-8")) + len(upload.content.encode("utf-8"))
+                upload_bytes = len(upload.path.encode("utf-8")) + len(
+                    upload.content.encode("utf-8")
+                )
                 if batch and (
                     len(batch) >= self.max_upload_blobs
                     or batch_bytes + upload_bytes > self.max_upload_bytes
@@ -453,20 +470,32 @@ class WorkspaceContext:
                 uploaded_names.update(received)
             uploaded = tuple(sorted(uploaded_names))
             self._wait_ready(tuple(sorted(to_upload)), None)
-            checkpoint_id = plan.delta.checkpoint_id
+            checkpoint_added = (
+                current_names if checkpoint_id is None else plan.delta.added_blobs
+            )
+            checkpoint_deleted = (
+                () if checkpoint_id is None else plan.delta.deleted_blobs
+            )
             try:
-                if plan.delta.added_blobs or plan.delta.deleted_blobs or checkpoint_id is None:
+                if checkpoint_added or checkpoint_deleted or checkpoint_id is None:
                     result = self.api.checkpoint(
                         checkpoint_id,
-                        plan.delta.added_blobs,
-                        plan.delta.deleted_blobs,
+                        checkpoint_added,
+                        checkpoint_deleted,
                     )
                     checkpoint_id = result.new_checkpoint_id
             except OceApiError as exc:
                 if exc.status_code != 404:
                     raise
-                # The server lost the chain. Rebuild the current workspace from scratch.
-                self.state.set_meta("checkpoint_id", None)
+                # The chain disappeared after the liveness check. Keep the local token
+                # until the replacement succeeds so a failed rebuild remains retryable.
+                missing = self.api.find_missing(current_names)
+                if missing.unknown_blob_names or missing.nonindexed_blob_names:
+                    raise CheckpointResetRequired(
+                        "server checkpoint and blob state changed; retry sync"
+                    ) from exc
+                checkpoint_added = current_names
+                checkpoint_deleted = ()
                 result = self.api.checkpoint(None, current_names, ())
                 checkpoint_id = result.new_checkpoint_id
             deleted_paths = [
@@ -475,9 +504,16 @@ class WorkspaceContext:
                 if row["status"] != FileStatus.PRESENT
                 and row["committed_blob_name"] in set(plan.delta.deleted_blobs)
             ]
-            self.state.commit_sync(checkpoint_id or "", deleted_paths, self.snapshot().generation)
+            self.state.commit_sync(
+                checkpoint_id or "", deleted_paths, self.snapshot().generation
+            )
             self.state.update_outbox(operation_id, "complete")
-            return SyncResult(uploaded, checkpoint_id, plan.delta.added_blobs, plan.delta.deleted_blobs)
+            return SyncResult(
+                uploaded,
+                checkpoint_id,
+                checkpoint_added,
+                checkpoint_deleted,
+            )
         except Exception as exc:
             self.state.update_outbox(operation_id, "failed", str(exc))
             raise
@@ -485,11 +521,24 @@ class WorkspaceContext:
     def retrieve(self, query: str, *, scope: str = "workspace") -> RetrievalResult:
         if scope not in {"workspace", "working_set"}:
             raise ValueError(f"unknown scope: {scope}")
-        if self.state.get_meta("synced_generation") != self.state.get_meta("generation"):
+        if self.state.get_meta("synced_generation") != self.state.get_meta(
+            "generation"
+        ):
             self.sync()
         snapshot = self.snapshot()
-        names = tuple(sorted(record.blob_name for record in snapshot.files.values() if record.status == FileStatus.PRESENT and record.blob_name))
-        return self.api.retrieve(query, snapshot.checkpoint_id, names if snapshot.checkpoint_id is None else (), ())
+        names = tuple(
+            sorted(
+                record.blob_name
+                for record in snapshot.files.values()
+                if record.status == FileStatus.PRESENT and record.blob_name
+            )
+        )
+        return self.api.retrieve(
+            query,
+            snapshot.checkpoint_id,
+            names if snapshot.checkpoint_id is None else (),
+            (),
+        )
 
     def start_watching(self, *, debounce_ms: int = 300) -> WatchHandle:
         if self._watch is not None:

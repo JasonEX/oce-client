@@ -44,7 +44,11 @@ class FakeApi:
         return UploadResult(names)
 
     def blob_status(self, names, checkpoint_id=None):
-        return BlobStatusResult(tuple(n for n in names if n not in self.known), ())
+        return BlobStatusResult(
+            tuple(n for n in names if n not in self.known),
+            (),
+            checkpoint_id is not None and checkpoint_id != self.checkpoint_id,
+        )
 
     def checkpoint(self, checkpoint_id, added, deleted):
         if self.fail_checkpoint:
@@ -242,9 +246,7 @@ def test_incremental_sync_rejects_file_beneath_symlinked_directory(tmp_path: Pat
         assert second.deleted_blobs == (original_blob,)
         assert original_blob not in api.checkpoint_members
         assert all(
-            upload.content != "private"
-            for call in api.upload_calls
-            for upload in call
+            upload.content != "private" for call in api.upload_calls for upload in call
         )
     finally:
         context.close()
@@ -260,6 +262,52 @@ def test_upload_failure_does_not_advance_checkpoint(tmp_path: Path):
             context.sync()
         assert context.snapshot().checkpoint_id is None
         assert context.state.pending_outbox()
+    finally:
+        context.close()
+
+
+def test_sync_rebuilds_missing_checkpoint_from_complete_inventory(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    api = FakeApi()
+    context = WorkspaceContext.open(tmp_path, api, ready_poll_attempts=1)
+    try:
+        first = context.sync()
+        current_names = tuple(sorted(api.checkpoint_members))
+        api.checkpoint_id = None
+        api.checkpoint_members.clear()
+
+        rebuilt = context.sync()
+
+        assert api.checkpoint_calls[-1] == (None, current_names, ())
+        assert tuple(sorted(api.checkpoint_members)) == current_names
+        assert rebuilt.added_blobs == current_names
+        assert rebuilt.checkpoint_id is not None
+        assert first.checkpoint_id is not None
+    finally:
+        context.close()
+
+
+def test_failed_checkpoint_rebuild_preserves_retry_state(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x", encoding="utf-8")
+    api = FakeApi()
+    context = WorkspaceContext.open(tmp_path, api, ready_poll_attempts=1)
+    try:
+        first = context.sync()
+        current_names = tuple(sorted(api.checkpoint_members))
+        api.checkpoint_id = None
+        api.checkpoint_members.clear()
+        api.fail_checkpoint = True
+
+        with pytest.raises(RuntimeError, match="checkpoint failed"):
+            context.sync()
+
+        assert context.snapshot().checkpoint_id == first.checkpoint_id
+
+        api.fail_checkpoint = False
+        rebuilt = context.sync()
+        assert api.checkpoint_calls[-1] == (None, current_names, ())
+        assert tuple(sorted(api.checkpoint_members)) == current_names
+        assert rebuilt.checkpoint_id is not None
     finally:
         context.close()
 
@@ -310,7 +358,9 @@ def test_http_adapter_uses_oce_payloads():
         requests.append((request.url.path, json.loads(request.content)))
         if request.url.path == "/batch-upload":
             return httpx.Response(200, json={"blob_names": ["a" * 64]})
-        return httpx.Response(200, json={"unknown_memory_names": [], "nonindexed_blob_names": []})
+        return httpx.Response(
+            200, json={"unknown_memory_names": [], "nonindexed_blob_names": []}
+        )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     api = OceHttpClient("http://oce.test", "secret", client=client)
