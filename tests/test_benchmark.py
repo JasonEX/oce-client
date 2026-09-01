@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -20,9 +21,14 @@ from oce_client.benchmark import (
     load_variants,
     parse_retrieved_paths,
     run_benchmark,
+    run_lexical_baseline,
     score_case,
     validate_corpus,
     verify_variant_profile,
+)
+from oce_client.benchmark_lexical import (
+    lexical_baseline_profile,
+    lexical_query_terms,
 )
 
 
@@ -42,7 +48,8 @@ def _comparison_payload(
     *,
     case: BenchmarkCase | None = None,
     embedding_fingerprint: str = "b" * 64,
-    verified: bool = True,
+    named_variant: bool = True,
+    lexical_baseline: bool = False,
 ) -> dict[str, object]:
     selected = case or _case()
     repositories = {
@@ -63,13 +70,20 @@ def _comparison_payload(
                 "revision": repositories["oce"].revision,
             }
         },
-        "variant": {"name": label} if verified else None,
-        "server_profile": {
-            "profile": {
-                "state": "compatible",
-                "embedding_fingerprint": embedding_fingerprint,
+        "variant": {"name": label} if named_variant and not lexical_baseline else None,
+        "baseline": (
+            lexical_baseline_profile("ripgrep 14.1.0") if lexical_baseline else None
+        ),
+        "server_profile": (
+            None
+            if lexical_baseline
+            else {
+                "profile": {
+                    "state": "compatible",
+                    "embedding_fingerprint": embedding_fingerprint,
+                }
             }
-        },
+        ),
         "summary": summary,
         "cases": [
             {
@@ -158,6 +172,20 @@ def test_parse_and_score_retrieval_paths():
     assert result.recall_at_10 == 1.0
     assert result.reciprocal_rank == 0.5
     assert result.ndcg_at_10 == pytest.approx(0.693426, rel=1e-5)
+
+
+def test_lexical_query_terms_keep_symbols_and_remove_question_scaffolding():
+    terms = {
+        term.casefold()
+        for term in lexical_query_terms(
+            "Where is WorkspaceContext and model_credentials 定义在哪里？"
+        )
+    }
+
+    assert {"workspacecontext", "workspace", "context"} <= terms
+    assert {"model_credentials", "model", "credentials"} <= terms
+    assert "where" not in terms
+    assert "defined" not in terms
 
 
 def test_aggregate_preserves_errors_as_zero_score():
@@ -261,7 +289,7 @@ def test_compare_rejects_corpus_or_embedding_confounds(tmp_path):
     )
 
 
-def test_compare_requires_verified_variants_by_default(tmp_path):
+def test_compare_accepts_ad_hoc_results_for_internal_experiments(tmp_path):
     summary = {
         "cases": 1,
         "top1": 0.0,
@@ -274,23 +302,55 @@ def test_compare_requires_verified_variants_by_default(tmp_path):
         "external_model_tokens": None,
         "estimated_external_cost": None,
     }
-    verified = tmp_path / "verified.json"
-    unverified = tmp_path / "unverified.json"
-    verified.write_text(
-        json.dumps(_comparison_payload("verified", summary)),
+    named = tmp_path / "named.json"
+    ad_hoc = tmp_path / "ad-hoc.json"
+    named.write_text(
+        json.dumps(_comparison_payload("named", summary)),
         encoding="utf-8",
     )
-    unverified.write_text(
-        json.dumps(_comparison_payload("ad-hoc", summary, verified=False)),
+    ad_hoc.write_text(
+        json.dumps(_comparison_payload("ad-hoc", summary, named_variant=False)),
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="unverified ad hoc"):
-        compare_results([verified, unverified])
-    assert "| ad-hoc |" in compare_results(
-        [verified, unverified],
-        allow_unverified=True,
+    assert "| ad-hoc |" in compare_results([named, ad_hoc])
+
+
+def test_compare_accepts_lexical_baseline_alongside_named_variant(tmp_path):
+    summary = {
+        "cases": 1,
+        "top1": 1.0,
+        "recall_at_10": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "agent_solved_rate": None,
+        "mean_elapsed_ms": 1,
+        "mean_returned_chars": 100,
+        "external_model_tokens": {},
+        "estimated_external_cost": 0.0,
+    }
+    lexical = tmp_path / "lexical.json"
+    variant = tmp_path / "variant.json"
+    lexical.write_text(
+        json.dumps(
+            _comparison_payload(
+                "ripgrep-lexical-v1",
+                summary,
+                named_variant=False,
+                lexical_baseline=True,
+            )
+        ),
+        encoding="utf-8",
     )
+    variant.write_text(
+        json.dumps(_comparison_payload("dense", summary)),
+        encoding="utf-8",
+    )
+
+    table = compare_results([lexical, variant])
+
+    assert "| ripgrep-lexical-v1 |" in table
+    assert "| dense |" in table
 
 
 def test_task_outcomes_reject_unknown_cases(tmp_path):
@@ -377,3 +437,71 @@ def test_run_preserves_sync_failures_as_case_errors(tmp_path, monkeypatch):
     assert payload["summary"]["top1"] == 0.0
     assert payload["cases"][0]["status"] == "error"
     assert payload["cases"][0]["error"] == "sync unavailable with [REDACTED]"
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+def test_run_lexical_baseline_uses_admitted_files_and_needs_no_server(
+    tmp_path, monkeypatch
+):
+    repositories = tmp_path / "repositories.json"
+    repositories.write_text(
+        json.dumps(
+            {
+                "repo": {
+                    "url": "https://example.invalid/repo.git",
+                    "revision": "a" * 40,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text(
+        json.dumps(
+            {
+                "id": "lexical",
+                "repository": "repo",
+                "category": "symbol_definition",
+                "query": "Where is WorkspaceContext defined?",
+                "expected_paths": ["src/context.py"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    workdir = tmp_path / "workspaces"
+    root = workdir / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src/context.py").write_text(
+        "class WorkspaceContext:\n    pass\n",
+        encoding="utf-8",
+    )
+    (root / "noise.py").write_text(
+        "context = 'workspace context context'\n",
+        encoding="utf-8",
+    )
+    (root / ".env").write_text(
+        "WorkspaceContext=must-not-be-searched\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("oce_client.benchmark.validate_corpus", lambda *args: None)
+    args = SimpleNamespace(
+        repositories=repositories,
+        cases=cases,
+        repository=[],
+        category=[],
+        case=[],
+        workdir=workdir,
+        metadata=[],
+    )
+
+    payload = run_lexical_baseline(args)
+
+    assert payload["variant"] is None
+    assert payload["server_profile"] is None
+    assert payload["baseline"]["kind"] == "ripgrep_lexical"
+    assert payload["baseline"]["agent_workflow"] is False
+    assert payload["sync"]["repo"]["admitted_files"] == 2
+    assert payload["summary"]["error_cases"] == 0
+    assert payload["summary"]["external_model_tokens"] == {}
+    assert payload["cases"][0]["retrieved_paths"][0] == "src/context.py"

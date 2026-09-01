@@ -16,6 +16,14 @@ from typing import Iterable, Sequence
 
 import httpx
 
+from oce_client.benchmark_lexical import (
+    lexical_baseline_profile,
+    resolve_ripgrep,
+    retrieve_lexically,
+    ripgrep_version,
+)
+from oce_client.filesystem import LocalFileSource
+from oce_client.ignore import LayeredIgnoreMatcher
 from oce_client.runtime import ClientRuntime, ClientSettings
 
 
@@ -111,14 +119,6 @@ def _json_fingerprint(value: object) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _file_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def corpus_fingerprint(
@@ -670,12 +670,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     outcomes = _load_outcomes(args.task_outcomes, {case.id for case in corpus})
     metadata = _parse_key_values(args.metadata)
     prices = _parse_key_values(args.price, numeric=True)
-    variants_path = Path(getattr(args, "variants", DEFAULT_VARIANTS))
-    manifest_hashes = {
-        "repositories": _file_fingerprint(Path(args.repositories)),
-        "cases": _file_fingerprint(Path(args.cases)),
-        "variants": _file_fingerprint(variants_path),
-    }
     api_url = args.api_url or os.environ.get("OCE_API_URL", "http://127.0.0.1:8986")
     api_key = os.environ.get("OCE_API_KEY", "sk-opencontextengine")
     admin_key = os.environ.get("OCE_ADMIN_API_KEY")
@@ -785,13 +779,97 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "api_url": api_url,
         "corpus_fingerprint": corpus_fingerprint(repositories, cases),
-        "manifest_hashes": manifest_hashes,
         "repositories": {
             name: asdict(repositories[name])
             for name in sorted({case.repository for case in cases})
         },
         "variant": asdict(variant) if variant is not None else None,
+        "baseline": None,
         "server_profile": server_profile,
+        "metadata": metadata,
+        "sync": sync,
+        "summary": summary,
+        "cases": [asdict(item) for item in results],
+    }
+
+
+def run_lexical_baseline(args: argparse.Namespace) -> dict[str, object]:
+    repositories = load_repositories(args.repositories)
+    corpus = load_cases(args.cases)
+    cases = _selected_cases(corpus, args)
+    workdir = args.workdir.resolve()
+    validate_corpus(repositories, cases, workdir)
+    metadata = _parse_key_values(args.metadata)
+    executable = resolve_ripgrep()
+    baseline = lexical_baseline_profile(ripgrep_version(executable))
+
+    documents: dict[str, dict[str, str]] = {}
+    scan_errors: dict[str, Exception] = {}
+    sync: dict[str, object] = {}
+    for name in sorted({case.repository for case in cases}):
+        started = time.perf_counter()
+        root = (workdir / name).resolve()
+        try:
+            admitted = LocalFileSource().scan(root, LayeredIgnoreMatcher(root))
+            if not admitted:
+                raise ValueError(f"no admissible benchmark files found: {root}")
+            documents[name] = admitted
+        except Exception as exc:
+            scan_errors[name] = exc
+            sync[name] = {
+                "status": "error",
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "error_type": type(exc).__name__,
+                "error": _safe_error_message(exc),
+            }
+        else:
+            sync[name] = {
+                "status": "ok",
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "admitted_files": len(admitted),
+                "admitted_chars": sum(len(content) for content in admitted.values()),
+            }
+
+    results: list[CaseResult] = []
+    for case in cases:
+        if error := scan_errors.get(case.repository):
+            results.append(failed_case(case, error))
+            continue
+        started = time.perf_counter()
+        try:
+            retrieval = retrieve_lexically(
+                (workdir / case.repository).resolve(),
+                documents[case.repository],
+                case.query,
+                executable=executable,
+            )
+            results.append(
+                score_case(
+                    case,
+                    retrieval.paths,
+                    returned_chars=len(retrieval.formatted_context),
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                )
+            )
+        except Exception as exc:
+            results.append(failed_case(case, exc))
+
+    summary = aggregate(results)
+    summary["external_model_tokens"] = {}
+    summary["estimated_external_cost"] = 0.0
+    return {
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "label": f"ripgrep-lexical-v{baseline['version']}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "api_url": None,
+        "corpus_fingerprint": corpus_fingerprint(repositories, cases),
+        "repositories": {
+            name: asdict(repositories[name])
+            for name in sorted({case.repository for case in cases})
+        },
+        "variant": None,
+        "baseline": baseline,
+        "server_profile": None,
         "metadata": metadata,
         "sync": sync,
         "summary": summary,
@@ -809,70 +887,18 @@ def _format_value(value: object, *, percent: bool = False) -> str:
     return str(value)
 
 
-def _result_corpus_fingerprint(payload: dict[str, object], path: Path) -> str:
-    raw_repositories = payload.get("repositories")
-    raw_cases = payload.get("cases")
-    if not isinstance(raw_repositories, dict) or not isinstance(raw_cases, list):
-        raise ValueError(f"result has no reproducible corpus material: {path}")
-    repositories: dict[str, RepositorySpec] = {}
-    for name, value in raw_repositories.items():
-        if not isinstance(name, str) or not isinstance(value, dict):
-            raise ValueError(f"invalid result repository material: {path}")
-        repositories[name] = RepositorySpec(
-            name=name,
-            url=str(value.get("url", "")),
-            revision=str(value.get("revision", "")),
-        )
-        if not repositories[name].url or len(repositories[name].revision) != 40:
-            raise ValueError(f"invalid result repository identity: {path}")
-    cases: list[BenchmarkCase] = []
-    for value in raw_cases:
-        if not isinstance(value, dict) or not isinstance(
-            value.get("expected_paths"), (list, tuple)
-        ):
-            raise ValueError(f"invalid result case material: {path}")
-        cases.append(
-            BenchmarkCase(
-                id=str(value.get("id", "")),
-                repository=str(value.get("repository", "")),
-                category=str(value.get("category", "")),
-                query=str(value.get("query", "")),
-                expected_paths=tuple(str(item) for item in value["expected_paths"]),
-            )
-        )
-        if (
-            not cases[-1].id
-            or not cases[-1].repository
-            or not cases[-1].query.strip()
-            or not cases[-1].expected_paths
-        ):
-            raise ValueError(f"invalid result case identity: {path}")
-    if not cases or len({case.id for case in cases}) != len(cases):
-        raise ValueError(f"result cases are empty or duplicated: {path}")
-    try:
-        return corpus_fingerprint(repositories, cases)
-    except KeyError as exc:
-        raise ValueError(f"result references an unknown repository: {path}") from exc
-
-
 def _comparison_identity(
     payload: dict[str, object],
     path: Path,
-    *,
-    allow_unverified: bool,
 ) -> tuple[str, str | None, str]:
     if payload.get("schema_version") != BENCHMARK_SCHEMA_VERSION:
         raise ValueError(
             f"unsupported benchmark schema in {path}; rerun with schema "
             f"{BENCHMARK_SCHEMA_VERSION}"
         )
-    recorded_corpus = payload.get("corpus_fingerprint")
-    computed_corpus = _result_corpus_fingerprint(payload, path)
-    if recorded_corpus != computed_corpus:
-        raise ValueError(
-            f"result corpus fingerprint does not match its contents: {path}"
-        )
-
+    corpus = payload.get("corpus_fingerprint")
+    if not isinstance(corpus, str) or len(corpus) != 64:
+        raise ValueError(f"result has no corpus identity: {path}")
     label = str(payload.get("label", path.stem))
     variant = payload.get("variant")
     server_profile = payload.get("server_profile")
@@ -889,23 +915,17 @@ def _comparison_identity(
         ):
             raise ValueError(f"named variant has no embedding fingerprint: {path}")
     else:
-        if not allow_unverified:
-            raise ValueError(
-                f"unverified ad hoc result cannot be compared: {path}; "
-                "pass --allow-unverified to override"
-            )
         embedding_fingerprint = (
             profile.get("embedding_fingerprint") if isinstance(profile, dict) else None
         )
         if not isinstance(embedding_fingerprint, str):
             embedding_fingerprint = None
-    return computed_corpus, embedding_fingerprint, label
+    return corpus, embedding_fingerprint, label
 
 
 def compare_results(
     paths: Sequence[Path],
     *,
-    allow_unverified: bool = False,
     allow_embedding_change: bool = False,
 ) -> str:
     headers = (
@@ -931,11 +951,7 @@ def compare_results(
             payload.get("summary"), dict
         ):
             raise ValueError(f"invalid benchmark result: {path}")
-        corpus, embedding, label = _comparison_identity(
-            payload,
-            path,
-            allow_unverified=allow_unverified,
-        )
+        corpus, embedding, label = _comparison_identity(payload, path)
         if expected_corpus is None:
             expected_corpus = corpus
         elif corpus != expected_corpus:
@@ -1015,7 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     identity.add_argument(
         "--label",
-        help="ad hoc, unverified configuration label",
+        help="ad hoc configuration label",
     )
     run.add_argument("--api-url")
     run.add_argument("--state-dir", type=Path)
@@ -1032,13 +1048,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--metrics-settle-seconds", type=float, default=6.0)
 
+    baseline = subparsers.add_parser(
+        "baseline",
+        help="run the deterministic no-model ripgrep lexical baseline",
+    )
+    baseline.add_argument("--workdir", type=Path, required=True)
+    baseline.add_argument("--output", type=Path, required=True)
+    baseline.add_argument("--repository", action="append", default=[])
+    baseline.add_argument("--category", action="append", default=[])
+    baseline.add_argument("--case", action="append", default=[])
+    baseline.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
+
     compare = subparsers.add_parser("compare", help="render a Markdown variant table")
     compare.add_argument("results", nargs="+", type=Path)
-    compare.add_argument(
-        "--allow-unverified",
-        action="store_true",
-        help="include ad hoc --label results that lack a verified variant profile",
-    )
     compare.add_argument(
         "--allow-embedding-change",
         action="store_true",
@@ -1094,11 +1121,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
         return 0
+    if args.command == "baseline":
+        payload = run_lexical_baseline(args)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
+        return 0
     if args.command == "compare":
         print(
             compare_results(
                 args.results,
-                allow_unverified=args.allow_unverified,
                 allow_embedding_change=args.allow_embedding_change,
             )
         )
