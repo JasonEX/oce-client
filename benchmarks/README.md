@@ -16,6 +16,9 @@ resolved embedding model and dimensions reported by the server.
 The harness reports Top-1, Recall@10, MRR, nDCG@10, returned characters, and end-to-end
 latency. Workspace-sync and query errors remain in the raw result and score as zero rather
 than disappearing.
+Each result also records SHA-256 hashes of the repository, case, and variant manifests plus
+a canonical fingerprint of the selected repositories, revisions, queries, and expected
+paths. Editing a result's corpus fields without updating that identity is detected.
 When `OCE_ADMIN_API_KEY` is available on an isolated benchmark server, it also records the
 delta in external model calls and tokens after excluding workspace indexing. Optional
 per-kind prices convert that delta into an explicit cost estimate. Agent task outcomes are
@@ -118,6 +121,12 @@ The command prints a Markdown table with retrieval quality, task-success evidenc
 returned context, external tokens, and estimated cost. Result JSON stores queries, expected
 paths, retrieved paths, metrics, and errors, but never stores returned source-code content or
 API keys.
+
+`compare` rejects different case filters/corpora, duplicate labels, old result schemas,
+unverified `--label` runs, and different embedding fingerprints. This keeps a component
+ablation from silently becoming a model or dataset comparison. For an intentional model
+comparison, pass `--allow-embedding-change`; for explicitly documented exploratory results,
+pass `--allow-unverified`. Corpus mismatches are never combined into one table.
 
 The corpus is a checked-in starting point, not a claim that 50 cases cover every repository
 shape. Add cases from real coding work with reviewed path labels, keep failures, and compare

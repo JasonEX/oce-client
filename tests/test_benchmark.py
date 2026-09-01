@@ -6,11 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from oce_client.benchmark import (
+    BENCHMARK_SCHEMA_VERSION,
     BenchmarkCase,
+    RepositorySpec,
     _load_outcomes,
     _parse_key_values,
     aggregate,
     compare_results,
+    corpus_fingerprint,
     failed_case,
     load_cases,
     load_repositories,
@@ -33,6 +36,53 @@ def _case() -> BenchmarkCase:
     )
 
 
+def _comparison_payload(
+    label: str,
+    summary: dict[str, object],
+    *,
+    case: BenchmarkCase | None = None,
+    embedding_fingerprint: str = "b" * 64,
+    verified: bool = True,
+) -> dict[str, object]:
+    selected = case or _case()
+    repositories = {
+        "oce": RepositorySpec(
+            name="oce",
+            url="https://example.test/oce.git",
+            revision="a" * 40,
+        )
+    }
+    return {
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "label": label,
+        "corpus_fingerprint": corpus_fingerprint(repositories, [selected]),
+        "repositories": {
+            "oce": {
+                "name": "oce",
+                "url": repositories["oce"].url,
+                "revision": repositories["oce"].revision,
+            }
+        },
+        "variant": {"name": label} if verified else None,
+        "server_profile": {
+            "profile": {
+                "state": "compatible",
+                "embedding_fingerprint": embedding_fingerprint,
+            }
+        },
+        "summary": summary,
+        "cases": [
+            {
+                "id": selected.id,
+                "repository": selected.repository,
+                "category": selected.category,
+                "query": selected.query,
+                "expected_paths": list(selected.expected_paths),
+            }
+        ],
+    }
+
+
 def test_checked_in_corpus_is_well_formed_and_has_fifty_cases():
     repositories = load_repositories()
     cases = load_cases()
@@ -44,6 +94,7 @@ def test_checked_in_corpus_is_well_formed_and_has_fifty_cases():
     assert len(cases) == 50
     assert len({case.id for case in cases}) == 50
     assert len(variants) == 9
+    assert len(corpus_fingerprint(repositories, cases)) == 64
 
 
 def test_variant_profile_must_match_live_server_controls():
@@ -68,6 +119,7 @@ def test_variant_profile_must_match_live_server_controls():
             "fingerprint": "a" * 64,
             "schema_version": 1,
             "embedding_enabled": True,
+            "embedding_fingerprint": "b" * 64,
             "embedding_model": "embedding-v1",
             "embedding_dimensions": 1024,
         },
@@ -144,10 +196,10 @@ def test_compare_renders_decision_metrics(tmp_path):
         "estimated_external_cost": None,
     }
     first.write_text(
-        json.dumps({"label": "dense", "summary": summary}), encoding="utf-8"
+        json.dumps(_comparison_payload("dense", summary)), encoding="utf-8"
     )
     second.write_text(
-        json.dumps({"label": "rerank", "summary": summary}), encoding="utf-8"
+        json.dumps(_comparison_payload("rerank", summary)), encoding="utf-8"
     )
 
     table = compare_results([first, second])
@@ -155,6 +207,90 @@ def test_compare_renders_decision_metrics(tmp_path):
     assert "| Variant | Cases | Top-1 | Recall@10 |" in table
     assert "| dense | 2 | 50.0% | 75.0% |" in table
     assert "| rerank | 2 | 50.0% | 75.0% |" in table
+
+
+def test_compare_rejects_corpus_or_embedding_confounds(tmp_path):
+    summary = {
+        "cases": 1,
+        "top1": 0.0,
+        "recall_at_10": 0.0,
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "agent_solved_rate": None,
+        "mean_elapsed_ms": 1,
+        "mean_returned_chars": 1,
+        "external_model_tokens": None,
+        "estimated_external_cost": None,
+    }
+    baseline = tmp_path / "baseline.json"
+    changed = tmp_path / "changed.json"
+    baseline.write_text(
+        json.dumps(_comparison_payload("baseline", summary)),
+        encoding="utf-8",
+    )
+    changed_case = BenchmarkCase(
+        id="case-2",
+        repository="oce",
+        category="feature",
+        query="different query",
+        expected_paths=("src/other.py",),
+    )
+    changed.write_text(
+        json.dumps(_comparison_payload("changed", summary, case=changed_case)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="different corpora"):
+        compare_results([baseline, changed])
+
+    changed.write_text(
+        json.dumps(
+            _comparison_payload(
+                "changed",
+                summary,
+                embedding_fingerprint="c" * 64,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="different embedding profiles"):
+        compare_results([baseline, changed])
+    assert "| changed |" in compare_results(
+        [baseline, changed],
+        allow_embedding_change=True,
+    )
+
+
+def test_compare_requires_verified_variants_by_default(tmp_path):
+    summary = {
+        "cases": 1,
+        "top1": 0.0,
+        "recall_at_10": 0.0,
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "agent_solved_rate": None,
+        "mean_elapsed_ms": 1,
+        "mean_returned_chars": 1,
+        "external_model_tokens": None,
+        "estimated_external_cost": None,
+    }
+    verified = tmp_path / "verified.json"
+    unverified = tmp_path / "unverified.json"
+    verified.write_text(
+        json.dumps(_comparison_payload("verified", summary)),
+        encoding="utf-8",
+    )
+    unverified.write_text(
+        json.dumps(_comparison_payload("ad-hoc", summary, verified=False)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unverified ad hoc"):
+        compare_results([verified, unverified])
+    assert "| ad-hoc |" in compare_results(
+        [verified, unverified],
+        allow_unverified=True,
+    )
 
 
 def test_task_outcomes_reject_unknown_cases(tmp_path):

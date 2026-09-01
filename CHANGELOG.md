@@ -10,6 +10,7 @@ Entries are generated from Conventional Commits.
 - **benchmark**: add a pinned 50-case retrieval, cost, and agent-outcome evaluation harness
 - **benchmark**: verify checked-in ablation variants against the live server runtime profile
 - **benchmark**: require a compatible persisted index fingerprint and record the resolved embedding model
+- **benchmark**: fingerprint corpus manifests and reject confounded or unverified comparisons
 
 ### Fixed
 
