@@ -150,7 +150,7 @@ def test_variant_profile_must_match_live_server_controls():
         verify_variant_profile(variant, index_stats)
 
     index_stats["runtime"]["exact_enabled"] = True
-    index_stats["profile"]["state"] = "stored_unverified"
+    index_stats["profile"]["state"] = "incompatible"
     with pytest.raises(ValueError, match="index profile state"):
         verify_variant_profile(variant, index_stats)
 
