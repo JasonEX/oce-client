@@ -21,6 +21,36 @@ from oce_client.runtime import ClientRuntime, ClientSettings
 ROOT = Path(__file__).resolve().parents[2] / "benchmarks"
 DEFAULT_REPOSITORIES = ROOT / "repositories.json"
 DEFAULT_CASES = ROOT / "cases.jsonl"
+DEFAULT_VARIANTS = ROOT / "variants.json"
+
+VARIANT_PROFILE_FIELDS = {
+    "CHUNKING_SEMANTIC_ENABLED": ("runtime", "semantic_chunking_enabled"),
+    "RETRIEVAL_EXACT_ENABLED": ("runtime", "exact_enabled"),
+    "RETRIEVAL_PATH_INDEX_ENABLED": ("runtime", "path_index_enabled"),
+    "RETRIEVAL_SOURCE_PRIORITY_ENABLED": (
+        "runtime",
+        "source_priority_enabled",
+    ),
+    "RETRIEVAL_COVERAGE_SELECTION_ENABLED": (
+        "runtime",
+        "coverage_selection_enabled",
+    ),
+    "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": (
+        "runtime",
+        "query_decomposition_enabled",
+    ),
+    "RERANK_ENABLED": ("runtime", "api_rerank_enabled"),
+    "LLM_RERANK_ENABLED": ("runtime", "llm_rerank_enabled"),
+    "RETRIEVAL_QUERY_REWRITE_ENABLED": ("runtime", "query_rewrite_enabled"),
+    "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": (
+        "runtime",
+        "intent_classification_enabled",
+    ),
+    "EMBED_QUERY_CACHE_MAX_ENTRIES": ("query_cache", "max_entries"),
+}
+_BOOLEAN_VARIANT_FIELDS = frozenset(VARIANT_PROFILE_FIELDS) - {
+    "EMBED_QUERY_CACHE_MAX_ENTRIES"
+}
 
 
 @dataclass(frozen=True)
@@ -37,6 +67,13 @@ class BenchmarkCase:
     category: str
     query: str
     expected_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BenchmarkVariant:
+    name: str
+    description: str
+    environment: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -123,6 +160,64 @@ def load_cases(path: Path = DEFAULT_CASES) -> list[BenchmarkCase]:
     if not cases:
         raise ValueError("benchmark corpus is empty")
     return cases
+
+
+def load_variants(path: Path = DEFAULT_VARIANTS) -> dict[str, BenchmarkVariant]:
+    payload = _read_json(path)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("variants manifest must be a non-empty JSON object")
+    variants: dict[str, BenchmarkVariant] = {}
+    required = set(VARIANT_PROFILE_FIELDS)
+    for name, value in payload.items():
+        if not isinstance(name, str) or not name or not isinstance(value, dict):
+            raise ValueError("variant entries must be named JSON objects")
+        description = value.get("description")
+        environment = value.get("environment")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"variant {name!r} needs a description")
+        if not isinstance(environment, dict) or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in environment.items()
+        ):
+            raise ValueError(
+                f"variant {name!r} environment must map strings to strings"
+            )
+        missing = sorted(required - environment.keys())
+        unexpected = sorted(environment.keys() - required)
+        if missing or unexpected:
+            raise ValueError(
+                f"variant {name!r} has missing fields {missing} "
+                f"and unexpected fields {unexpected}"
+            )
+        invalid_booleans = sorted(
+            key
+            for key in _BOOLEAN_VARIANT_FIELDS
+            if environment[key] not in {"true", "false"}
+        )
+        if invalid_booleans:
+            raise ValueError(
+                f"variant {name!r} boolean fields must use true/false: "
+                f"{invalid_booleans}"
+            )
+        try:
+            cache_entries = int(environment["EMBED_QUERY_CACHE_MAX_ENTRIES"])
+        except ValueError as exc:
+            raise ValueError(
+                f"variant {name!r} cache capacity must be a non-negative integer"
+            ) from exc
+        if (
+            cache_entries < 0
+            or str(cache_entries) != environment["EMBED_QUERY_CACHE_MAX_ENTRIES"]
+        ):
+            raise ValueError(
+                f"variant {name!r} cache capacity must be a non-negative integer"
+            )
+        variants[name] = BenchmarkVariant(
+            name=name,
+            description=description.strip(),
+            environment=dict(environment),
+        )
+    return variants
 
 
 def parse_retrieved_paths(formatted_retrieval: str) -> tuple[str, ...]:
@@ -357,6 +452,50 @@ def _admin_stats(api_url: str, admin_key: str) -> dict[str, object]:
     return value
 
 
+def _admin_index_stats(api_url: str, admin_key: str) -> dict[str, object]:
+    response = httpx.get(
+        f"{api_url.rstrip('/')}/admin/index-stats",
+        headers={"Authorization": f"Bearer {admin_key}"},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    value = response.json()
+    if not isinstance(value, dict):
+        raise ValueError("admin index stats response must be an object")
+    return value
+
+
+def verify_variant_profile(
+    variant: BenchmarkVariant,
+    index_stats: dict[str, object],
+) -> dict[str, object]:
+    """Verify that a named result is backed by the declared server controls."""
+    mismatches: list[str] = []
+    actual_profile: dict[str, object] = {"runtime": {}, "query_cache": {}}
+    for environment_name, (section_name, field_name) in VARIANT_PROFILE_FIELDS.items():
+        section = index_stats.get(section_name)
+        actual = section.get(field_name) if isinstance(section, dict) else None
+        raw_expected = variant.environment[environment_name]
+        expected: object = (
+            raw_expected == "true"
+            if environment_name in _BOOLEAN_VARIANT_FIELDS
+            else int(raw_expected)
+        )
+        profile_section = actual_profile[section_name]
+        assert isinstance(profile_section, dict)
+        profile_section[field_name] = actual
+        if type(actual) is not type(expected) or actual != expected:
+            mismatches.append(
+                f"{environment_name} expected {expected!r}, got {actual!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            f"server profile does not match variant {variant.name!r}: "
+            + "; ".join(mismatches)
+        )
+    return actual_profile
+
+
 def _token_totals(stats: dict[str, object]) -> dict[str, dict[str, int]]:
     output: dict[str, dict[str, int]] = {}
     tokens = stats.get("tokens", [])
@@ -419,6 +558,19 @@ def _selected_cases(
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
+    variant_name = getattr(args, "variant", None)
+    label = getattr(args, "label", None)
+    if bool(variant_name) == bool(label):
+        raise ValueError("provide exactly one of variant or label")
+    variant: BenchmarkVariant | None = None
+    if variant_name:
+        variants = load_variants(getattr(args, "variants", DEFAULT_VARIANTS))
+        try:
+            variant = variants[variant_name]
+        except KeyError as exc:
+            raise ValueError(f"unknown benchmark variant: {variant_name}") from exc
+        label = variant.name
+
     repositories = load_repositories(args.repositories)
     corpus = load_cases(args.cases)
     cases = _selected_cases(corpus, args)
@@ -430,6 +582,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     api_url = args.api_url or os.environ.get("OCE_API_URL", "http://127.0.0.1:8986")
     api_key = os.environ.get("OCE_API_KEY", "sk-opencontextengine")
     admin_key = os.environ.get("OCE_ADMIN_API_KEY")
+    server_profile: dict[str, object] | None = None
+    if variant is not None:
+        if not admin_key:
+            raise ValueError(
+                "OCE_ADMIN_API_KEY is required to verify a named benchmark variant"
+            )
+        server_profile = verify_variant_profile(
+            variant,
+            _admin_index_stats(api_url, admin_key),
+        )
 
     state_context = (
         tempfile.TemporaryDirectory(prefix="oce-benchmark-")
@@ -521,14 +683,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         _estimate_cost(token_delta, prices) if token_delta is not None else None
     )
     return {
-        "schema_version": 1,
-        "label": args.label,
+        "schema_version": 2,
+        "label": label,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "api_url": api_url,
         "repositories": {
             name: asdict(repositories[name])
             for name in sorted({case.repository for case in cases})
         },
+        "variant": asdict(variant) if variant is not None else None,
+        "server_profile": server_profile,
         "metadata": metadata,
         "sync": sync,
         "summary": summary,
@@ -601,6 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the OCE retrieval benchmark")
     parser.add_argument("--repositories", type=Path, default=DEFAULT_REPOSITORIES)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
+    parser.add_argument("--variants", type=Path, default=DEFAULT_VARIANTS)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     validate = subparsers.add_parser(
@@ -611,12 +776,25 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare", help="clone pinned benchmark workspaces")
     prepare.add_argument("--workdir", type=Path, required=True)
 
+    variants = subparsers.add_parser(
+        "variants", help="show reproducible server configurations"
+    )
+    variants.add_argument("name", nargs="?")
+
     run = subparsers.add_parser(
         "run", help="sync workspaces and execute retrieval cases"
     )
     run.add_argument("--workdir", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--label", required=True)
+    identity = run.add_mutually_exclusive_group(required=True)
+    identity.add_argument(
+        "--variant",
+        help="checked-in variant whose live server profile must match",
+    )
+    identity.add_argument(
+        "--label",
+        help="ad hoc, unverified configuration label",
+    )
     run.add_argument("--api-url")
     run.add_argument("--state-dir", type=Path)
     run.add_argument("--repository", action="append", default=[])
@@ -642,12 +820,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "validate":
         repositories = load_repositories(args.repositories)
         cases = load_cases(args.cases)
+        variants = load_variants(args.variants)
         validate_corpus(
             repositories, cases, args.workdir.resolve() if args.workdir else None
         )
         print(
             json.dumps(
-                {"repositories": len(repositories), "cases": len(cases)}, sort_keys=True
+                {
+                    "repositories": len(repositories),
+                    "cases": len(cases),
+                    "variants": len(variants),
+                },
+                sort_keys=True,
             )
         )
         return 0
@@ -655,6 +839,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         repositories = load_repositories(args.repositories)
         prepare_workspaces(repositories, args.workdir.resolve())
         validate_corpus(repositories, load_cases(args.cases), args.workdir.resolve())
+        return 0
+    if args.command == "variants":
+        available = load_variants(args.variants)
+        if args.name:
+            try:
+                payload = asdict(available[args.name])
+            except KeyError as exc:
+                raise ValueError(f"unknown benchmark variant: {args.name}") from exc
+        else:
+            payload = {name: asdict(available[name]) for name in sorted(available)}
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if args.command == "run":
         if args.metrics_settle_seconds < 0:

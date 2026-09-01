@@ -8,6 +8,7 @@ Entries are generated from Conventional Commits.
 ### Added
 
 - **benchmark**: add a pinned 50-case retrieval, cost, and agent-outcome evaluation harness
+- **benchmark**: verify checked-in ablation variants against the live server runtime profile
 
 ### Fixed
 

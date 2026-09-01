@@ -6,6 +6,11 @@ checked-in corpus contains 50 queries across pinned public revisions of `oce` an
 `oce-client`, covering symbol definition, feature location, cross-file flow, architecture,
 configuration, references, and bug localization.
 
+`variants.json` defines cumulative ablations from recursive dense retrieval through hybrid
+recall, selection, and model reranking. A named run is accepted only when the server's
+authenticated `/admin/index-stats` runtime profile matches every declared switch. This
+prevents a result label from silently describing a configuration that was not running.
+
 The harness reports Top-1, Recall@10, MRR, nDCG@10, returned characters, and end-to-end
 latency. Workspace-sync and query errors remain in the raw result and score as zero rather
 than disappearing.
@@ -21,6 +26,7 @@ From the `oce-client` repository:
 
 ```bash
 uv run python benchmarks/evaluate.py validate
+uv run python benchmarks/evaluate.py variants
 uv run python benchmarks/evaluate.py prepare --workdir /tmp/oce-benchmark-workspaces
 ```
 
@@ -29,32 +35,53 @@ be clean and at the required revision; the command will not reset or overwrite t
 
 ## Run a variant
 
-Start an OCE server with the model and retrieval configuration under test, then run:
+Inspect one checked-in configuration:
+
+```bash
+uv run python benchmarks/evaluate.py variants dense-exact-path
+```
+
+Apply all of its `environment` values to an isolated OCE server, use a fresh server data
+directory, and start the service. A fresh index is required whenever chunking changes;
+reusing a data directory would compare new retrieval controls against old chunks. Disable
+unrelated traffic so monitoring deltas remain attributable to this run.
+
+Then run the named variant:
 
 ```bash
 export OCE_API_URL=http://127.0.0.1:8986
 export OCE_API_KEY=sk-opencontextengine
+export OCE_ADMIN_API_KEY=sk-admin
 
 uv run python benchmarks/evaluate.py run \
   --workdir /tmp/oce-benchmark-workspaces \
-  --label dense-exact-path \
+  --variant dense-exact-path \
   --metadata embedding=Qwen3-Embedding-4B \
   --output /tmp/oce-results/dense-exact-path.json
 ```
 
-For an isolated server with monitoring enabled, set `OCE_ADMIN_API_KEY`. The default six
-second settling interval allows the asynchronous metrics buffer to flush before snapshots.
-Pass prices in USD per million tokens when a cost estimate is wanted:
+`OCE_ADMIN_API_KEY` is mandatory for named variants: the harness checks the live chunking,
+recall, priority, selector, rerank, rewrite, intent, decomposition, and query-cache settings
+before any workspace sync. The checked-in variants disable the query-vector cache so one
+run cannot benefit from warm queries left by another.
+
+The default six-second settling interval allows the asynchronous metrics buffer to flush
+before snapshots. Pass prices in USD per million tokens when a cost estimate is wanted:
 
 ```bash
 uv run python benchmarks/evaluate.py run \
   --workdir /tmp/oce-benchmark-workspaces \
-  --label adaptive-rerank \
+  --variant adaptive-llm-rerank \
   --price embed=0.08 \
   --price rerank=0.10 \
   --price llm_rerank=0.20 \
   --output /tmp/oce-results/adaptive-rerank.json
 ```
+
+`--label NAME` remains available for exploratory configurations that are not in
+`variants.json`. Such runs deliberately skip live-profile verification and record
+`variant: null`; do not mix them with verified ablations without documenting the exact
+server environment in `--metadata`.
 
 To attach agent-task evidence, provide a JSON object mapping case IDs to booleans:
 
@@ -75,8 +102,9 @@ the experiment.
 
 ## Compare variants
 
-Run each configuration against its own server session and data directory. Do not let an
-agent choose between retrieval systems inside one session; that confounds attribution.
+Run each configuration against its own server session, client state, and server data
+directory. Do not let an agent choose between retrieval systems inside one session; that
+confounds attribution.
 
 ```bash
 uv run python benchmarks/evaluate.py compare /tmp/oce-results/*.json

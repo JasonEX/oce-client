@@ -14,10 +14,12 @@ from oce_client.benchmark import (
     failed_case,
     load_cases,
     load_repositories,
+    load_variants,
     parse_retrieved_paths,
     run_benchmark,
     score_case,
     validate_corpus,
+    verify_variant_profile,
 )
 
 
@@ -34,12 +36,42 @@ def _case() -> BenchmarkCase:
 def test_checked_in_corpus_is_well_formed_and_has_fifty_cases():
     repositories = load_repositories()
     cases = load_cases()
+    variants = load_variants()
 
     validate_corpus(repositories, cases)
 
     assert len(repositories) == 2
     assert len(cases) == 50
     assert len({case.id for case in cases}) == 50
+    assert len(variants) == 9
+
+
+def test_variant_profile_must_match_live_server_controls():
+    variant = load_variants()["full-no-rerank"]
+    index_stats = {
+        "runtime": {
+            "semantic_chunking_enabled": True,
+            "exact_enabled": True,
+            "path_index_enabled": True,
+            "source_priority_enabled": True,
+            "coverage_selection_enabled": True,
+            "query_decomposition_enabled": True,
+            "api_rerank_enabled": False,
+            "llm_rerank_enabled": False,
+            "query_rewrite_enabled": False,
+            "intent_classification_enabled": False,
+        },
+        "query_cache": {"max_entries": 0},
+    }
+
+    profile = verify_variant_profile(variant, index_stats)
+
+    assert profile["runtime"]["exact_enabled"] is True
+    assert profile["query_cache"]["max_entries"] == 0
+
+    index_stats["runtime"]["exact_enabled"] = False
+    with pytest.raises(ValueError, match="RETRIEVAL_EXACT_ENABLED"):
+        verify_variant_profile(variant, index_stats)
 
 
 def test_parse_and_score_retrieval_paths():
@@ -183,6 +215,7 @@ def test_run_preserves_sync_failures_as_case_errors(tmp_path, monkeypatch):
         api_url="http://127.0.0.1:8986",
         state_dir=None,
         metrics_settle_seconds=0,
+        variant=None,
         label="sync-failure",
     )
 

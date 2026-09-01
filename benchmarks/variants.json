@@ -1,0 +1,146 @@
+{
+  "adaptive-llm-rerank": {
+    "description": "Full deterministic retrieval with adaptive LLM semantic reranking.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "true",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "true",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "true",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
+  },
+  "api-rerank": {
+    "description": "Full deterministic retrieval with the configured rerank API.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "true",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "true",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "true",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
+  },
+  "dense-exact": {
+    "description": "Semantic chunks and dense retrieval plus exact identifier recall.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "false",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "false",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "false"
+    }
+  },
+  "dense-exact-path": {
+    "description": "Semantic dense and exact recall plus the independent path index.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "false",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "false"
+    }
+  },
+  "dense-exact-path-source": {
+    "description": "Dense, exact, and path recall with source-priority weighting.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "false",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
+  },
+  "dense-exact-path-source-selector": {
+    "description": "Source-weighted hybrid recall with focused or coverage selection.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "true",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
+  },
+  "dense-recursive": {
+    "description": "Recursive chunks and dense retrieval without hybrid stages.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "false",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "false",
+      "RETRIEVAL_EXACT_ENABLED": "false",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "false",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "false"
+    }
+  },
+  "dense-semantic": {
+    "description": "Semantic cAST chunks with dense retrieval only.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "false",
+      "RETRIEVAL_EXACT_ENABLED": "false",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "false",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "false",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "false"
+    }
+  },
+  "full-no-rerank": {
+    "description": "Full deterministic hybrid retrieval without model reranking.",
+    "environment": {
+      "CHUNKING_SEMANTIC_ENABLED": "true",
+      "EMBED_QUERY_CACHE_MAX_ENTRIES": "0",
+      "LLM_RERANK_ENABLED": "false",
+      "RERANK_ENABLED": "false",
+      "RETRIEVAL_COVERAGE_SELECTION_ENABLED": "true",
+      "RETRIEVAL_EXACT_ENABLED": "true",
+      "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED": "false",
+      "RETRIEVAL_PATH_INDEX_ENABLED": "true",
+      "RETRIEVAL_QUERY_DECOMPOSITION_ENABLED": "true",
+      "RETRIEVAL_QUERY_REWRITE_ENABLED": "false",
+      "RETRIEVAL_SOURCE_PRIORITY_ENABLED": "true"
+    }
+  }
+}
