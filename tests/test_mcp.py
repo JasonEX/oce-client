@@ -248,6 +248,38 @@ def test_mcp_does_not_queue_ignored_file_changes(tmp_path: Path):
         _stop(server)
 
 
+def test_mcp_queues_symlink_replacement_without_following_target(tmp_path: Path):
+    calls: list[str] = []
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.py"
+    outside.write_text("private", encoding="utf-8")
+    link = tmp_path / "changed.py"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+    def factory(settings: ClientSettings) -> FakeRuntime:
+        return FakeRuntime(settings, calls)
+
+    server = create_server(
+        ClientSettings(tmp_path, "http://oce.test", "test-key"),
+        initial_sync="off",
+        ready_timeout=1,
+        runtime_factory=factory,
+    )
+    try:
+        result = _call(server, "codebase-retrieval", {"information_request": "find x"})
+        assert result["status"] == "ready"
+
+        indexer = server._oce_indexers[tmp_path.resolve()]
+        indexer.notify_changes({link})
+
+        assert indexer.wait_until_ready(1) == "ready"
+        assert "sync_paths:1" in calls
+    finally:
+        _stop(server)
+
+
 def test_mcp_enforces_configured_workspace_allowlist(tmp_path: Path):
     calls: list[str] = []
     workspace = tmp_path / "workspace"

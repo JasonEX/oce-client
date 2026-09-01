@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -112,16 +113,17 @@ class WorkspaceIndexer:
         matcher = LayeredIgnoreMatcher(self.root, self.settings.runtime_patterns)
         relevant: set[Path] = set()
         for path in paths:
-            resolved = path.resolve()
+            candidate = path if path.is_absolute() else self.root / path
+            lexical = Path(os.path.abspath(candidate))
             try:
-                relative = resolved.relative_to(self.root).as_posix()
+                relative = lexical.relative_to(self.root).as_posix()
             except ValueError:
                 continue
-            if resolved.name in {".gitignore", ".oceignore"} or not matcher.ignores(
+            if lexical.name in {".gitignore", ".oceignore"} or not matcher.ignores(
                 relative,
-                is_dir=resolved.is_dir(),
+                is_dir=lexical.is_dir(),
             ):
-                relevant.add(resolved)
+                relevant.add(lexical)
         if not relevant:
             return
         with self._condition:

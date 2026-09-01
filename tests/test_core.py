@@ -188,6 +188,68 @@ def test_incremental_sync_does_not_reread_unchanged_files(tmp_path: Path):
         restarted.close()
 
 
+def test_incremental_sync_removes_file_replaced_by_outside_symlink(tmp_path: Path):
+    path = tmp_path / "linked.py"
+    path.write_text("public", encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    api = FakeApi()
+    context = WorkspaceContext.open(tmp_path, api, ready_poll_attempts=1)
+    try:
+        first = context.sync()
+        original_blob = first.added_blobs[0]
+        path.unlink()
+        try:
+            path.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"symbolic links are unavailable: {exc}")
+
+        second = context.sync_paths({path})
+
+        assert second.added_blobs == ()
+        assert second.deleted_blobs == (original_blob,)
+        assert original_blob not in api.checkpoint_members
+        assert all(
+            upload.content != "private" for call in api.upload_calls for upload in call
+        )
+    finally:
+        context.close()
+
+
+def test_incremental_sync_rejects_file_beneath_symlinked_directory(tmp_path: Path):
+    package = tmp_path / "package"
+    package.mkdir()
+    path = package / "module.py"
+    path.write_text("public", encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "module.py").write_text("private", encoding="utf-8")
+    api = FakeApi()
+    context = WorkspaceContext.open(tmp_path, api, ready_poll_attempts=1)
+    try:
+        first = context.sync()
+        original_blob = first.added_blobs[0]
+        path.unlink()
+        package.rmdir()
+        try:
+            package.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symbolic links are unavailable: {exc}")
+
+        second = context.sync_paths({package / "module.py"})
+
+        assert second.added_blobs == ()
+        assert second.deleted_blobs == (original_blob,)
+        assert original_blob not in api.checkpoint_members
+        assert all(
+            upload.content != "private"
+            for call in api.upload_calls
+            for upload in call
+        )
+    finally:
+        context.close()
+
+
 def test_upload_failure_does_not_advance_checkpoint(tmp_path: Path):
     (tmp_path / "a.py").write_text("x", encoding="utf-8")
     api = FakeApi()

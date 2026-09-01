@@ -240,7 +240,12 @@ class WorkspaceContext:
             candidate = Path(path)
             if not candidate.is_absolute():
                 candidate = self.root / candidate
-            resolved_paths.add(candidate.resolve())
+            lexical = Path(os.path.abspath(candidate))
+            try:
+                lexical.relative_to(self.root)
+            except ValueError:
+                continue
+            resolved_paths.add(lexical)
         if not resolved_paths:
             return self.snapshot()
         for path in resolved_paths:
@@ -262,7 +267,22 @@ class WorkspaceContext:
                 for path in current.files
                 if path == relative or path.startswith(relative.rstrip("/") + "/")
             }
-            if not source_path.is_file() or matcher.ignores(relative):
+            try:
+                physical = source_path.resolve(strict=True)
+                physical.relative_to(self.root)
+            except (OSError, ValueError):
+                physical = None
+            relative_parts = Path(relative).parts
+            has_symlink_component = any(
+                (self.root.joinpath(*relative_parts[:index])).is_symlink()
+                for index in range(1, len(relative_parts) + 1)
+            )
+            if (
+                physical is None
+                or has_symlink_component
+                or not source_path.is_file()
+                or matcher.ignores(relative)
+            ):
                 deleted.update(
                     path
                     for path in tracked
