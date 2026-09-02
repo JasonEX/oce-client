@@ -211,7 +211,7 @@ impl StateStore {
     pub fn upsert_file(&self, record: &FileRecord) -> Result<(), StateError> {
         let mut connection = self.connection()?;
         let transaction = Self::transaction(&mut connection)?;
-        upsert_record(&transaction, record)?;
+        upsert_record(&transaction, record, record.generation)?;
         set_meta_in(&transaction, "generation", &record.generation.to_string())?;
         transaction.commit().map_err(StateError::Sqlite)
     }
@@ -227,9 +227,7 @@ impl StateStore {
         let mut connection = self.connection()?;
         let transaction = Self::transaction(&mut connection)?;
         for record in records {
-            let mut current = record.clone();
-            current.generation = generation;
-            upsert_record(&transaction, &current)?;
+            upsert_record(&transaction, record, generation)?;
         }
         for path in deleted_paths {
             transaction
@@ -329,7 +327,11 @@ fn set_meta_in(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<
     Ok(())
 }
 
-fn upsert_record(transaction: &Transaction<'_>, record: &FileRecord) -> Result<(), StateError> {
+fn upsert_record(
+    transaction: &Transaction<'_>,
+    record: &FileRecord,
+    generation: i64,
+) -> Result<(), StateError> {
     let size = i64::try_from(record.size).map_err(|_| {
         StateError::InvalidValue(format!("file size is too large: {}", record.size))
     })?;
@@ -357,7 +359,7 @@ fn upsert_record(transaction: &Transaction<'_>, record: &FileRecord) -> Result<(
                 size,
                 record.modified_ns,
                 record.source.as_str(),
-                record.generation,
+                generation,
             ],
         )
         .map_err(StateError::Sqlite)?;

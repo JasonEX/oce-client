@@ -1,12 +1,12 @@
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::thread;
 
 use oce_client::identity::calculate_blob_identity;
 use serde_json::{Value, json};
+
+mod common;
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oce-client"))
@@ -36,7 +36,54 @@ fn rust_cli_sync_and_retrieve_run_the_real_wire_and_state_path() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.py"), "print(1)").unwrap();
     let state_path = root.path().join("rust-state.sqlite3");
-    let (api_url, server) = fake_oce_server();
+    let (api_url, server) = common::fake_oce_server(vec![
+        (
+            "/find-missing",
+            common::respond(|request| {
+                json!({
+                    "unknown_memory_names": request["mem_object_names"],
+                    "nonindexed_blob_names": []
+                })
+            }),
+        ),
+        (
+            "/batch-upload",
+            common::respond(|request| {
+                let names = request["blobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|blob| {
+                        calculate_blob_identity(
+                            blob["path"].as_str().unwrap(),
+                            blob["content"].as_str().unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                json!({"blob_names": names})
+            }),
+        ),
+        (
+            "/agents/blob-status",
+            common::json_response(json!({
+                "unknown_blob_names": [],
+                "nonindexed_blob_names": [],
+                "checkpoint_not_found": false
+            })),
+        ),
+        (
+            "/checkpoint-blobs",
+            common::json_response(json!({"new_checkpoint_id": "chain:1"})),
+        ),
+        (
+            "/agents/codebase-retrieval",
+            common::json_response(json!({
+                "formatted_retrieval": "retrieved context",
+                "codebase_retrieval_elapsed_ms": 3
+            })),
+        ),
+    ]);
 
     let sync = clean_command()
         .args([
@@ -207,98 +254,4 @@ fn rust_skill_is_embedded_in_the_single_binary() {
     let path = PathBuf::from(payload["path"].as_str().unwrap());
     assert!(path.join("SKILL.md").is_file());
     assert!(path.join("agents/openai.yaml").is_file());
-}
-
-fn fake_oce_server() -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let thread = thread::spawn(move || {
-        for expected in [
-            "/find-missing",
-            "/batch-upload",
-            "/agents/blob-status",
-            "/checkpoint-blobs",
-            "/agents/codebase-retrieval",
-        ] {
-            let (mut stream, _) = listener.accept().unwrap();
-            let (path, request) = read_request(&mut stream);
-            assert_eq!(path, expected);
-            let response = match expected {
-                "/find-missing" => json!({
-                    "unknown_memory_names": request["mem_object_names"],
-                    "nonindexed_blob_names": []
-                }),
-                "/batch-upload" => {
-                    let blobs = request["blobs"].as_array().unwrap();
-                    let names = blobs
-                        .iter()
-                        .map(|blob| {
-                            calculate_blob_identity(
-                                blob["path"].as_str().unwrap(),
-                                blob["content"].as_str().unwrap(),
-                            )
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>();
-                    json!({"blob_names": names})
-                }
-                "/agents/blob-status" => json!({
-                    "unknown_blob_names": [],
-                    "nonindexed_blob_names": [],
-                    "checkpoint_not_found": false
-                }),
-                "/checkpoint-blobs" => json!({"new_checkpoint_id": "chain:1"}),
-                "/agents/codebase-retrieval" => json!({
-                    "formatted_retrieval": "retrieved context",
-                    "codebase_retrieval_elapsed_ms": 3
-                }),
-                _ => unreachable!(),
-            };
-            let body = serde_json::to_vec(&response).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(&body).unwrap();
-        }
-    });
-    (format!("http://{address}"), thread)
-}
-
-fn read_request(stream: &mut TcpStream) -> (String, Value) {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    let header_end = loop {
-        let count = stream.read(&mut buffer).unwrap();
-        bytes.extend_from_slice(&buffer[..count]);
-        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break index + 4;
-        }
-    };
-    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-    let mut lines = headers.split("\r\n");
-    let path = lines
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .to_owned();
-    let length = lines
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        })
-        .unwrap();
-    while bytes.len() - header_end < length {
-        let count = stream.read(&mut buffer).unwrap();
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    (
-        path,
-        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap(),
-    )
 }

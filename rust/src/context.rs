@@ -227,12 +227,8 @@ impl WorkspaceContext {
                 && existing.modified_ns == file.modified_ns
                 && existing.size == file.size
             {
+                // Unchanged on disk; the stored record stays as it is.
                 known_paths.insert(path);
-                records.push(FileRecord {
-                    content: None,
-                    generation,
-                    ..existing.clone()
-                });
                 continue;
             }
             if let Some(record) = self.filesystem_record(&path, &file.path, &current, generation)? {

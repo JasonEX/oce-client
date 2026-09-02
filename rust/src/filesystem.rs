@@ -91,13 +91,11 @@ impl LocalFileSource {
             {
                 continue;
             }
-            let canonical = match path.canonicalize() {
-                Ok(value) if value.starts_with(root) => value,
-                _ => continue,
-            };
+            // `directory` is canonical and symlinks were skipped, so `path` is physical;
+            // `read_within` re-verifies it around the actual read.
             files.push(DiscoveredFile {
                 relative_path: relative,
-                path: canonical,
+                path,
                 size: metadata.len(),
                 modified_ns: modified_ns(&metadata),
             });

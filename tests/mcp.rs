@@ -1,15 +1,25 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::thread;
-
 use oce_client::config::{ClientSettings, InitialSync, McpConfiguration};
 use oce_client::mcp::McpServer;
 use serde_json::json;
 
+mod common;
+
 #[test]
 fn rust_mcp_initializes_lists_and_calls_retrieval() {
     let root = tempfile::tempdir().expect("workspace");
-    let (api_url, server_thread) = fake_oce_server();
+    let (api_url, server_thread) = common::fake_oce_server(vec![
+        (
+            "/checkpoint-blobs",
+            common::json_response(json!({"new_checkpoint_id": "chain:1"})),
+        ),
+        (
+            "/agents/codebase-retrieval",
+            common::json_response(json!({
+                "formatted_retrieval": "retrieved context",
+                "codebase_retrieval_elapsed_ms": 3
+            })),
+        ),
+    ]);
     let server = McpServer::new(McpConfiguration {
         workspaces: vec![ClientSettings {
             root: root.path().canonicalize().unwrap(),
@@ -90,68 +100,4 @@ fn rust_mcp_initializes_lists_and_calls_retrieval() {
 
     server.stop().expect("stop MCP indexer");
     server_thread.join().expect("fake OCE server");
-}
-
-fn fake_oce_server() -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake OCE");
-    let address = listener.local_addr().unwrap();
-    let thread = thread::spawn(move || {
-        for (expected_path, response) in [
-            ("/checkpoint-blobs", json!({"new_checkpoint_id": "chain:1"})),
-            (
-                "/agents/codebase-retrieval",
-                json!({
-                    "formatted_retrieval": "retrieved context",
-                    "codebase_retrieval_elapsed_ms": 3
-                }),
-            ),
-        ] {
-            let (mut stream, _) = listener.accept().expect("accept OCE request");
-            let path = read_path_and_body(&mut stream);
-            assert_eq!(path, expected_path);
-            let body = serde_json::to_vec(&response).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(&body).unwrap();
-        }
-    });
-    (format!("http://{address}"), thread)
-}
-
-fn read_path_and_body(stream: &mut TcpStream) -> String {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    let header_end = loop {
-        let count = stream.read(&mut buffer).unwrap();
-        assert!(count > 0);
-        bytes.extend_from_slice(&buffer[..count]);
-        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break index + 4;
-        }
-    };
-    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
-    let mut lines = headers.split("\r\n");
-    let path = lines
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .to_owned();
-    let content_length = lines
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        })
-        .unwrap_or(0);
-    while bytes.len() - header_end < content_length {
-        let count = stream.read(&mut buffer).unwrap();
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    path
 }

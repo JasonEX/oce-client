@@ -1,131 +1,23 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use oce_client::context::WorkspaceContext;
-use oce_client::http::{
-    ApiError, BlobApi, BlobStatusResult, BlobUpload, MissingResult, RetrievalResult,
-};
 use oce_client::indexer::{Readiness, WorkspaceIndexer};
 
-#[derive(Debug, Default)]
-struct FakeState {
-    known: BTreeSet<String>,
-    checkpoint_id: Option<String>,
-    checkpoint_members: BTreeSet<String>,
-    checkpoint_counter: usize,
-}
-
-#[derive(Debug, Default)]
-struct IndexerApi {
-    state: Mutex<FakeState>,
-    block_find_missing: AtomicBool,
-    fail_find_missing_once: AtomicBool,
-    block_retrieve: AtomicBool,
-    retrieve_started: AtomicBool,
-    retrieve_calls: AtomicUsize,
-}
-
-impl BlobApi for IndexerApi {
-    fn find_missing(&self, names: &[String]) -> Result<MissingResult, ApiError> {
-        while self.block_find_missing.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        if self.fail_find_missing_once.swap(false, Ordering::AcqRel) {
-            return Err(ApiError::InvalidResponse(
-                "temporary sync failure".to_owned(),
-            ));
-        }
-        let state = self.state.lock().unwrap();
-        Ok(MissingResult {
-            unknown_blob_names: names
-                .iter()
-                .filter(|name| !state.known.contains(*name))
-                .cloned()
-                .collect(),
-            nonindexed_blob_names: Vec::new(),
-        })
-    }
-
-    fn batch_upload(&self, blobs: &[BlobUpload]) -> Result<Vec<String>, ApiError> {
-        let names = blobs
-            .iter()
-            .map(|blob| blob.blob_name.clone())
-            .collect::<Vec<_>>();
-        self.state.lock().unwrap().known.extend(names.clone());
-        Ok(names)
-    }
-
-    fn blob_status(
-        &self,
-        names: &[String],
-        checkpoint_id: Option<&str>,
-    ) -> Result<BlobStatusResult, ApiError> {
-        let state = self.state.lock().unwrap();
-        Ok(BlobStatusResult {
-            unknown_blob_names: names
-                .iter()
-                .filter(|name| !state.known.contains(*name))
-                .cloned()
-                .collect(),
-            nonindexed_blob_names: Vec::new(),
-            checkpoint_not_found: checkpoint_id.is_some()
-                && checkpoint_id != state.checkpoint_id.as_deref(),
-        })
-    }
-
-    fn checkpoint(
-        &self,
-        checkpoint_id: Option<&str>,
-        added: &[String],
-        deleted: &[String],
-    ) -> Result<String, ApiError> {
-        let mut state = self.state.lock().unwrap();
-        if checkpoint_id.is_some() && checkpoint_id != state.checkpoint_id.as_deref() {
-            return Err(ApiError::Http {
-                status_code: 404,
-                detail: "missing checkpoint".to_owned(),
-            });
-        }
-        state.checkpoint_members.extend(added.iter().cloned());
-        for name in deleted {
-            state.checkpoint_members.remove(name);
-        }
-        state.checkpoint_counter += 1;
-        let next = format!("chain:{}", state.checkpoint_counter);
-        state.checkpoint_id = Some(next.clone());
-        Ok(next)
-    }
-
-    fn retrieve(
-        &self,
-        query: &str,
-        checkpoint_id: Option<&str>,
-        _added: &[String],
-        _deleted: &[String],
-    ) -> Result<RetrievalResult, ApiError> {
-        self.retrieve_calls.fetch_add(1, Ordering::AcqRel);
-        self.retrieve_started.store(true, Ordering::Release);
-        while self.block_retrieve.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(RetrievalResult {
-            formatted_retrieval: format!("{query}:{}", checkpoint_id.unwrap_or("")),
-            elapsed_ms: 7,
-        })
-    }
-}
+mod common;
+use common::FakeApi;
 
 #[test]
 fn retrieval_discards_a_result_if_the_workspace_changes_during_the_request() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("a.py");
     fs::write(&path, "one").unwrap();
-    let api = Arc::new(IndexerApi::default());
+    let api = Arc::new(FakeApi::default());
     let indexer = indexer(root.path(), api.clone());
     indexer.start(true).unwrap();
     assert_eq!(
@@ -171,7 +63,7 @@ fn retrieval_discards_a_result_if_the_workspace_changes_during_the_request() {
     indexer.stop().unwrap();
 }
 
-fn indexer(root: &Path, api: Arc<IndexerApi>) -> WorkspaceIndexer {
+fn indexer(root: &Path, api: Arc<FakeApi>) -> WorkspaceIndexer {
     let context = WorkspaceContext::open(root, api, None, Vec::new()).unwrap();
     WorkspaceIndexer::new(context, Duration::from_millis(10))
 }
@@ -180,7 +72,7 @@ fn indexer(root: &Path, api: Arc<IndexerApi>) -> WorkspaceIndexer {
 fn retrieval_starts_indexing_and_returns_only_after_latest_generation() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.py"), "one").unwrap();
-    let api = Arc::new(IndexerApi::default());
+    let api = Arc::new(FakeApi::default());
     let indexer = indexer(root.path(), api);
     indexer.start(false).unwrap();
 
@@ -206,7 +98,7 @@ fn retrieval_starts_indexing_and_returns_only_after_latest_generation() {
 fn retrieval_reports_indexing_without_stale_context_on_timeout() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.py"), "one").unwrap();
-    let api = Arc::new(IndexerApi::default());
+    let api = Arc::new(FakeApi::default());
     api.block_find_missing.store(true, Ordering::Release);
     let indexer = indexer(root.path(), api.clone());
     indexer.start(true).unwrap();
@@ -231,7 +123,7 @@ fn retrieval_reports_indexing_without_stale_context_on_timeout() {
 fn failed_sync_is_retried_by_next_retrieval() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.py"), "one").unwrap();
-    let api = Arc::new(IndexerApi::default());
+    let api = Arc::new(FakeApi::default());
     api.fail_find_missing_once.store(true, Ordering::Release);
     let indexer = indexer(root.path(), api);
     indexer.start(true).unwrap();
