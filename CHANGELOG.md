@@ -5,6 +5,14 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-02
+
+### Fixed
+
+- **watch**: normalize filesystem event paths across macOS and Windows without following final symbolic links
+- **watch**: ignore non-mutating access events so local state reads cannot trigger repeated workspace synchronization
+- **ci**: pin the setup-uv action to a published release so benchmark validation runs reliably
+
 ## [0.1.1] - 2026-09-02
 
 ### Added
