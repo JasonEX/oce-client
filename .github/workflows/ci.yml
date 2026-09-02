@@ -46,10 +46,7 @@ jobs:
           if cargo test --all-targets --locked 2>&1 | tee cargo-test.log; then
             exit 0
           fi
-          message="$(tail -c 50000 cargo-test.log)"
-          message="${message//'%'/'%25'}"
-          message="${message//$'\r'/'%0D'}"
-          message="${message//$'\n'/'%0A'}"
+          message="$(tail -c 3500 cargo-test.log | tr '\r\n' '  ' | sed 's/%/%25/g')"
           printf '::error title=Rust tests failed::%s\n' "$message"
           exit 1
 
