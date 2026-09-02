@@ -40,7 +40,18 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --all-targets --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo test --all-targets --locked 2>&1 | tee cargo-test.log; then
+            exit 0
+          fi
+          message="$(tail -c 50000 cargo-test.log)"
+          message="${message//'%'/'%25'}"
+          message="${message//$'\r'/'%0D'}"
+          message="${message//$'\n'/'%0A'}"
+          printf '::error title=Rust tests failed::%s\n' "$message"
+          exit 1
 
   benchmark-tooling:
     name: benchmark tooling
@@ -48,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.13"
           enable-cache: false
