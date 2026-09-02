@@ -147,6 +147,9 @@ fn collect_event(
 ) -> bool {
     match event {
         Ok(event) => {
+            if event.kind.is_access() {
+                return true;
+            }
             paths.extend(event.paths);
             true
         }
@@ -189,4 +192,23 @@ pub enum WatchError {
     Thread(std::io::Error),
     #[error("filesystem watcher thread panicked")]
     Panicked,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::EventKind;
+    use notify::event::AccessKind;
+
+    #[test]
+    fn access_events_do_not_schedule_workspace_changes() {
+        let mut paths = BTreeSet::new();
+        let error = Mutex::new(None);
+        let on_error: Arc<dyn Fn() + Send + Sync> = Arc::new(|| panic!("unexpected error"));
+        let event = Event::new(EventKind::Access(AccessKind::Read))
+            .add_path(PathBuf::from("workspace/file.py"));
+
+        assert!(collect_event(Ok(event), &mut paths, &error, &on_error));
+        assert!(paths.is_empty());
+    }
 }

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::ignore_rules::LayeredIgnoreMatcher;
@@ -192,6 +192,48 @@ impl LocalFileSource {
         }
         String::from_utf8(bytes).map_err(|_| FileAdmissionError::InvalidUtf8(path.to_path_buf()))
     }
+}
+
+pub(crate) fn normalize_workspace_event_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let lexical = lexical_absolute(&candidate)?;
+    let normalized = canonicalize_parent_preserving_leaf(&lexical).unwrap_or(lexical);
+    normalized.strip_prefix(root).is_ok().then_some(normalized)
+}
+
+fn canonicalize_parent_preserving_leaf(path: &Path) -> Option<PathBuf> {
+    // Event paths may use an OS alias for the workspace root, while the final
+    // component may be a symlink that must be rejected without following it.
+    let mut suffix = vec![path.file_name()?.to_os_string()];
+    let mut ancestor = path.parent()?.to_path_buf();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return lexical_absolute(&canonical);
+        }
+        suffix.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?.to_path_buf();
+    }
+}
+
+fn lexical_absolute(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop().then_some(())?;
+            }
+            Component::CurDir => {}
+            value => normalized.push(value.as_os_str()),
+        }
+    }
+    Some(normalized)
 }
 
 #[cfg(unix)]

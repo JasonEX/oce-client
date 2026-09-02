@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::context::{ContextError, WorkspaceContext};
+use crate::filesystem::normalize_workspace_event_path;
 use crate::ignore_rules::LayeredIgnoreMatcher;
 use crate::watcher::{WatchError, WatchHandle};
 
@@ -390,22 +391,20 @@ impl IndexerInner {
         };
         let mut relevant = BTreeSet::new();
         for path in paths {
-            let candidate = if path.is_absolute() {
-                path
-            } else {
-                self.root.join(path)
-            };
-            let lexical = lexical_absolute(&candidate);
-            let Ok(relative) = lexical.strip_prefix(&self.root) else {
+            let Some(normalized) = normalize_workspace_event_path(&self.root, &path) else {
                 continue;
             };
-            let relative = relative.to_string_lossy().replace('\\', "/");
+            let relative = normalized
+                .strip_prefix(&self.root)
+                .expect("normalized event path must remain within the workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
             let is_ignore_file = matches!(
-                lexical.file_name().and_then(|name| name.to_str()),
+                normalized.file_name().and_then(|name| name.to_str()),
                 Some(".gitignore" | ".oceignore")
             );
-            if is_ignore_file || !matcher.ignores(&relative, lexical.is_dir()) {
-                relevant.insert(lexical);
+            if is_ignore_file || !matcher.ignores(&relative, normalized.is_dir()) {
+                relevant.insert(normalized);
             }
         }
         if relevant.is_empty() {
@@ -546,20 +545,6 @@ fn ready(control: &Control) -> bool {
         && !control.full_pending
         && control.pending_paths.is_empty()
         && control.synced_generation >= control.requested_generation
-}
-
-fn lexical_absolute(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                let _ = normalized.pop();
-            }
-            Component::CurDir => {}
-            value => normalized.push(value.as_os_str()),
-        }
-    }
-    normalized
 }
 
 struct ContextErrorText(String);

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::filesystem::{FileAdmissionError, LocalFileSource};
+use crate::filesystem::{FileAdmissionError, LocalFileSource, normalize_workspace_event_path};
 use crate::http::{ApiError, BlobApi, BlobUpload, RetrievalResult};
 use crate::identity::{IdentityError, calculate_blob_identity};
 use crate::ignore_rules::{IgnoreError, LayeredIgnoreMatcher};
@@ -284,14 +284,8 @@ impl WorkspaceContext {
     ) -> Result<WorkspaceSnapshot, ContextError> {
         let mut resolved = BTreeSet::new();
         for path in changed_paths {
-            let candidate = if path.is_absolute() {
-                path
-            } else {
-                self.root.join(path)
-            };
-            let lexical = normalize_lexical_absolute(&candidate)?;
-            if lexical.strip_prefix(&self.root).is_ok() {
-                resolved.insert(lexical);
+            if let Some(normalized) = normalize_workspace_event_path(&self.root, &path) {
+                resolved.insert(normalized);
             }
         }
         if resolved.is_empty() {

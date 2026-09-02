@@ -148,8 +148,21 @@ fn retrieval_discards_a_result_if_the_workspace_changes_during_the_request() {
         thread::sleep(Duration::from_millis(1));
     }
     fs::write(&path, "two changed").unwrap();
+
+    #[cfg(unix)]
+    let (notification_path, _alias_directory) = {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("workspace alias parent");
+        let alias = directory.path().join("workspace");
+        symlink(root.path(), &alias).expect("workspace alias");
+        (alias.join("a.py"), directory)
+    };
+    #[cfg(not(unix))]
+    let notification_path = path;
+
     indexer
-        .notify_changes(BTreeSet::from([path]))
+        .notify_changes(BTreeSet::from([notification_path]))
         .expect("notify changed file");
     api.block_retrieve.store(false, Ordering::Release);
 

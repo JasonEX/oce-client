@@ -323,11 +323,14 @@ fn rust_incremental_sync_drops_outside_symlink_without_reading_it() {
     let api = Arc::new(FakeApi::default());
     let context = context(root.path(), api.clone());
     let first = context.sync().expect("initial sync");
+    let alias_directory = tempfile::tempdir().expect("workspace alias parent");
+    let workspace_alias = alias_directory.path().join("workspace");
+    symlink(root.path(), &workspace_alias).expect("workspace alias");
     fs::remove_file(root.path().join("linked.py")).unwrap();
     symlink(outside.path(), root.path().join("linked.py")).unwrap();
 
     let second = context
-        .sync_paths([root.path().join("linked.py")])
+        .sync_paths([workspace_alias.join("linked.py")])
         .expect("incremental sync");
     assert!(second.added_blobs.is_empty());
     assert_eq!(second.deleted_blobs, first.added_blobs);

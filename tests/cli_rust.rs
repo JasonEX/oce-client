@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -5,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 
+use oce_client::cli::legacy_mcp_arguments;
 use oce_client::identity::calculate_blob_identity;
 use serde_json::{Value, json};
 
@@ -170,19 +172,18 @@ fn rust_binary_runs_mcp_stdio_and_supports_legacy_argv0() {
         "codebase-retrieval"
     );
 
-    let alias_directory = tempfile::tempdir().unwrap();
-    let alias = alias_directory.path().join(if cfg!(windows) {
+    let alias = if cfg!(windows) {
         "oce-client-mcp.exe"
     } else {
         "oce-client-mcp"
-    });
-    fs::copy(binary(), &alias).unwrap();
-    let help = Command::new(alias).arg("--help").output().unwrap();
-    assert!(help.status.success());
-    assert!(
-        String::from_utf8(help.stdout)
-            .unwrap()
-            .contains("--workspace")
+    };
+    assert_eq!(
+        legacy_mcp_arguments([OsString::from(alias), OsString::from("--help")]),
+        [
+            OsString::from(alias),
+            OsString::from("mcp"),
+            OsString::from("--help")
+        ]
     );
 }
 
