@@ -5,21 +5,25 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-02
+
 ### Added
 
-- **benchmark**: add a pinned 50-case retrieval, cost, and agent-outcome evaluation harness
-- **benchmark**: add diagnostic retrieval recipes, including an intent-classifier A/B pair
+- **benchmark**: add a pinned 50-case retrieval harness and diagnostic recipes, including an intent-classifier A/B pair
 - **release**: build native client archives for Linux, Windows, and macOS
 
 ### Fixed
 
 - **admission**: exclude common secret files and symbolic links from workspace uploads
-- **watch**: report filesystem watcher failures instead of silently continuing
+- **state**: recover expired checkpoints without losing local generation state
+- **watch**: report filesystem watcher failures and discard retrieval completed against an older generation
+- **release**: preserve packaged archives when collecting build artifacts
 
 ### Changed
 
 - **client**: replace the Python runtime and separate MCP entry point with one Rust binary
 - **mcp**: describe semantic retrieval as broad discovery whose results require verification
+- **benchmark**: keep Python only as optional development tooling that invokes the Rust client and records raw outcomes
 
 ## [0.1.0] - 2026-08-30
 
