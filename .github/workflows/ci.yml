@@ -40,15 +40,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run Rust tests
-        shell: bash
-        run: |
-          set -o pipefail
-          if cargo test --all-targets --locked 2>&1 | tee cargo-test.log; then
-            exit 0
-          fi
-          message="$(tail -c 3500 cargo-test.log | tr '\r\n' '  ' | sed 's/%/%25/g')"
-          printf '::error title=Rust tests failed::%s\n' "$message"
-          exit 1
+        run: cargo test --all-targets --locked
 
   benchmark-tooling:
     name: benchmark tooling
