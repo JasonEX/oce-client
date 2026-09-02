@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 const INTERNAL_DIRECTORIES: &[&str] = &[".git", ".oce-client"];
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct WatchHandle {
     stop: Arc<AtomicBool>,
@@ -51,47 +52,28 @@ impl WatchHandle {
             .name("oce-client-watcher".to_owned())
             .spawn(move || {
                 let _watcher = watcher;
-                while !thread_stop.load(Ordering::Acquire) {
-                    let event = match receiver.recv_timeout(Duration::from_millis(100)) {
-                        Ok(event) => event,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            if !thread_stop.load(Ordering::Acquire) {
-                                record_error(
-                                    &thread_error,
-                                    "filesystem watcher stopped unexpectedly".to_owned(),
-                                    &on_error,
-                                );
-                            }
-                            return;
-                        }
-                    };
+                let stopped = || thread_stop.load(Ordering::Acquire);
+                while !stopped() {
+                    // Collect events until the debounce window that opened with the first
+                    // event closes, waking regularly to observe stop requests.
                     let mut paths = BTreeSet::new();
-                    if !collect_event(event, &mut paths, &thread_error, &on_error) {
-                        return;
-                    }
-                    let deadline = Instant::now() + debounce;
-                    while !thread_stop.load(Ordering::Acquire) {
-                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
-                        else {
-                            break;
-                        };
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                    let mut deadline: Option<Instant> = None;
+                    loop {
+                        let timeout = deadline.map_or(STOP_POLL_INTERVAL, |deadline| {
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(STOP_POLL_INTERVAL)
+                        });
+                        match receiver.recv_timeout(timeout) {
                             Ok(event) => {
                                 if !collect_event(event, &mut paths, &thread_error, &on_error) {
                                     return;
                                 }
+                                deadline.get_or_insert_with(|| Instant::now() + debounce);
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if Instant::now() >= deadline {
-                                    break;
-                                }
-                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
                             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                if !thread_stop.load(Ordering::Acquire) {
+                                if !stopped() {
                                     record_error(
                                         &thread_error,
                                         "filesystem watcher stopped unexpectedly".to_owned(),
@@ -101,9 +83,15 @@ impl WatchHandle {
                                 return;
                             }
                         }
+                        if stopped() {
+                            return;
+                        }
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            break;
+                        }
                     }
                     paths.retain(|path| is_relevant(path));
-                    if !paths.is_empty() && !thread_stop.load(Ordering::Acquire) {
+                    if !paths.is_empty() {
                         callback(paths);
                     }
                 }
@@ -147,10 +135,9 @@ fn collect_event(
 ) -> bool {
     match event {
         Ok(event) => {
-            if event.kind.is_access() {
-                return true;
+            if !event.kind.is_access() {
+                paths.extend(event.paths);
             }
-            paths.extend(event.paths);
             true
         }
         Err(source) => {

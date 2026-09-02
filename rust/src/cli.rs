@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -6,14 +5,18 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use crate::VERSION;
-use crate::config::{ClientSettings, ConfigurationError, McpConfiguration, split_runtime_patterns};
+use crate::config::{
+    ClientSettings, ConfigurationError, DEFAULT_DEBOUNCE_MS, McpConfiguration, McpOptions,
+    split_runtime_patterns, user_home,
+};
 use crate::context::{ContextError, WorkspaceContext};
 use crate::indexer::{IndexerError, Readiness, WorkspaceIndexer};
 use crate::mcp::{McpError, McpServer, run_stdio};
+use crate::state::FileStatus;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,13 +60,13 @@ enum Command {
     Sync(JsonOutput),
     /// Show local inventory and checkpoint state.
     Status(JsonOutput),
+    /// List the files that sync would upload, without contacting the server.
+    ListFiles(JsonOutput),
     /// Retrieve formatted code context.
     Retrieve {
         query: String,
-        #[arg(long, value_enum, default_value_t = RetrievalScope::Workspace)]
-        scope: RetrievalScope,
-        #[arg(long = "json")]
-        as_json: bool,
+        #[command(flatten)]
+        output: JsonOutput,
     },
     /// Stage explicit file content.
     Observe {
@@ -72,18 +75,18 @@ enum Command {
         content: Option<String>,
         #[arg(long = "file", help = "read content from a file")]
         content_file: Option<PathBuf>,
-        #[arg(long = "json")]
-        as_json: bool,
+        #[command(flatten)]
+        output: JsonOutput,
     },
     /// Stage a file deletion.
     Remove {
         path: PathBuf,
-        #[arg(long = "json")]
-        as_json: bool,
+        #[command(flatten)]
+        output: JsonOutput,
     },
     /// Watch the workspace and sync on changes.
     Watch {
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = DEFAULT_DEBOUNCE_MS)]
         debounce_ms: u64,
     },
     /// Locate or install the bundled Codex skill.
@@ -101,22 +104,6 @@ struct JsonOutput {
     as_json: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum RetrievalScope {
-    Workspace,
-    #[value(name = "working_set")]
-    WorkingSet,
-}
-
-impl RetrievalScope {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Workspace => "workspace",
-            Self::WorkingSet => "working_set",
-        }
-    }
-}
-
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
     /// Print the materialized bundled skill path.
@@ -127,8 +114,8 @@ enum SkillCommand {
         target: Option<PathBuf>,
         #[arg(long)]
         force: bool,
-        #[arg(long = "json")]
-        as_json: bool,
+        #[command(flatten)]
+        output: JsonOutput,
     },
 }
 
@@ -151,8 +138,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = Cli::parse_from(arguments);
-    run(cli)
+    run(Cli::parse_from(arguments))
 }
 
 pub fn run(cli: Cli) -> Result<(), CliError> {
@@ -163,19 +149,41 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         ignore,
         command,
     } = cli;
+    let runtime_patterns = (!ignore.is_empty()).then(|| split_runtime_patterns(&ignore.join(",")));
     match command {
         Command::Skill { command } => run_skill(command),
-        Command::Mcp(arguments) => run_mcp(arguments, root, api_url, state_path, ignore),
+        Command::Mcp(arguments) => {
+            let workspace_roots = if arguments.workspace.is_empty() {
+                root.map(|root| vec![root])
+            } else {
+                Some(arguments.workspace)
+            };
+            let configuration = McpConfiguration::resolve(McpOptions {
+                workspace_roots,
+                api_url,
+                state_path,
+                state_dir: arguments.state_dir,
+                runtime_patterns,
+                debounce_ms: arguments.debounce_ms,
+                initial_sync: arguments.initial_sync,
+                ready_timeout_seconds: arguments.ready_timeout,
+            })?;
+            run_stdio(&McpServer::new(configuration)?)?;
+            Ok(())
+        }
         command => {
             let require_api_key = matches!(
                 command,
                 Command::Sync(_) | Command::Retrieve { .. } | Command::Watch { .. }
             );
-            let patterns = (!ignore.is_empty()).then(|| split_runtime_patterns(&ignore.join(",")));
-            let settings =
-                ClientSettings::resolve(root, api_url, state_path, patterns, require_api_key)?;
-            let context = settings.context()?;
-            run_workspace(command, context)
+            let settings = ClientSettings::resolve(
+                root,
+                api_url,
+                state_path,
+                runtime_patterns,
+                require_api_key,
+            )?;
+            run_workspace(command, settings.context()?)
         }
     }
 }
@@ -197,33 +205,16 @@ fn run_workspace(command: Command, context: WorkspaceContext) -> Result<(), CliE
         Command::Status(output) => {
             let snapshot = context.snapshot()?;
             if output.as_json {
-                let files = snapshot
-                    .files
-                    .into_iter()
-                    .map(|(path, record)| {
-                        (
-                            path,
-                            json!({
-                                "blob_name": record.blob_name,
-                                "committed_blob_name": record.committed_blob_name,
-                                "status": record.status,
-                                "size": record.size,
-                                "source": record.source,
-                                "generation": record.generation,
-                            }),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
                 print_json(&json!({
                     "checkpoint_id": snapshot.checkpoint_id,
                     "generation": snapshot.generation,
-                    "files": files,
+                    "files": snapshot.files,
                 }))?;
             } else {
                 let present = snapshot
                     .files
                     .values()
-                    .filter(|record| record.status == crate::state::FileStatus::Present)
+                    .filter(|record| record.status == FileStatus::Present)
                     .count();
                 println!("root={}", context.root().display());
                 println!(
@@ -233,13 +224,24 @@ fn run_workspace(command: Command, context: WorkspaceContext) -> Result<(), CliE
                 );
             }
         }
-        Command::Retrieve {
-            query,
-            scope,
-            as_json,
-        } => {
-            let result = context.retrieve(&query, scope.as_str())?;
-            if as_json {
+        Command::ListFiles(output) => {
+            let files = context.admitted_files()?;
+            if output.as_json {
+                print_json(&json!({
+                    "root": context.root().to_string_lossy(),
+                    "files": files,
+                }))?;
+            } else {
+                let stdout = io::stdout();
+                let mut stdout = stdout.lock();
+                for file in files {
+                    writeln!(stdout, "{file}")?;
+                }
+            }
+        }
+        Command::Retrieve { query, output } => {
+            let result = context.retrieve(&query)?;
+            if output.as_json {
                 print_json(&result)?;
             } else {
                 println!("{}", result.formatted_retrieval);
@@ -249,38 +251,33 @@ fn run_workspace(command: Command, context: WorkspaceContext) -> Result<(), CliE
             path,
             content,
             content_file,
-            as_json,
+            output,
         } => {
-            if content.is_some() && content_file.is_some() {
-                return Err(CliError::Invalid(
-                    "use either --content or --file, not both".to_owned(),
-                ));
-            }
             let content = match (content, content_file) {
-                (Some(content), None) => content,
-                (None, Some(path)) => {
-                    fs::read_to_string(&path).map_err(|source| CliError::ReadContent {
-                        path: path.clone(),
-                        source,
-                    })?
+                (Some(_), Some(_)) => {
+                    return Err(CliError::Invalid(
+                        "use either --content or --file, not both".to_owned(),
+                    ));
                 }
+                (Some(content), None) => content,
+                (None, Some(file)) => fs::read_to_string(&file)
+                    .map_err(|source| CliError::ReadContent { path: file, source })?,
                 (None, None) => {
                     let mut content = String::new();
                     io::stdin().read_to_string(&mut content)?;
                     content
                 }
-                (Some(_), Some(_)) => unreachable!(),
             };
             context.observe_file(&path, &content)?;
-            if as_json {
+            if output.as_json {
                 print_json(&json!({"path": path.to_string_lossy(), "status": "present"}))?;
             } else {
                 println!("observed {}", path.display());
             }
         }
-        Command::Remove { path, as_json } => {
+        Command::Remove { path, output } => {
             context.remove_file(&path)?;
-            if as_json {
+            if output.as_json {
                 print_json(&json!({"path": path.to_string_lossy(), "status": "deleted"}))?;
             } else {
                 println!("removed {}", path.display());
@@ -304,42 +301,16 @@ fn run_workspace(command: Command, context: WorkspaceContext) -> Result<(), CliE
                 }
             }
         }
-        Command::Skill { .. } | Command::Mcp(_) => unreachable!(),
+        Command::Skill { .. } | Command::Mcp(_) => unreachable!("dispatched by run"),
     }
-    Ok(())
-}
-
-fn run_mcp(
-    arguments: McpArgs,
-    root: Option<PathBuf>,
-    api_url: Option<String>,
-    state_path: Option<PathBuf>,
-    ignore: Vec<String>,
-) -> Result<(), CliError> {
-    let workspace_roots = if arguments.workspace.is_empty() {
-        root.map(|root| vec![root])
-    } else {
-        Some(arguments.workspace)
-    };
-    let configuration = McpConfiguration::resolve(
-        workspace_roots,
-        api_url,
-        state_path,
-        arguments.state_dir,
-        (!ignore.is_empty()).then(|| split_runtime_patterns(&ignore.join(","))),
-        arguments.debounce_ms,
-        arguments.initial_sync,
-        arguments.ready_timeout,
-    )?;
-    let server = McpServer::new(configuration)?;
-    run_stdio(&server)?;
     Ok(())
 }
 
 fn run_skill(command: SkillCommand) -> Result<(), CliError> {
     match command {
         SkillCommand::Path(output) => {
-            let path = materialize_skill()?;
+            let path = codex_home()?.join("cache").join("oce-client").join(VERSION);
+            write_embedded_skill(&path)?;
             if output.as_json {
                 print_json(&json!({"path": path.to_string_lossy()}))?;
             } else {
@@ -349,9 +320,12 @@ fn run_skill(command: SkillCommand) -> Result<(), CliError> {
         SkillCommand::Install {
             target,
             force,
-            as_json,
+            output,
         } => {
-            let target = target.unwrap_or(default_skill_target()?);
+            let target = match target {
+                Some(target) => target,
+                None => codex_home()?.join("skills").join("oce-client"),
+            };
             if target.exists() && !force {
                 return Err(CliError::Invalid(format!(
                     "skill target already exists: {}; pass --force to replace it",
@@ -359,7 +333,7 @@ fn run_skill(command: SkillCommand) -> Result<(), CliError> {
                 )));
             }
             write_embedded_skill(&target)?;
-            if as_json {
+            if output.as_json {
                 print_json(&json!({
                     "path": target.to_string_lossy(),
                     "status": "installed"
@@ -372,24 +346,13 @@ fn run_skill(command: SkillCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn materialize_skill() -> Result<PathBuf, CliError> {
-    let path = codex_home()?.join("cache").join("oce-client").join(VERSION);
-    write_embedded_skill(&path)?;
-    Ok(path)
-}
-
-fn default_skill_target() -> Result<PathBuf, CliError> {
-    Ok(codex_home()?.join("skills").join("oce-client"))
-}
-
 fn codex_home() -> Result<PathBuf, CliError> {
     if let Some(path) = std::env::var_os("CODEX_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let user_home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| CliError::Invalid("cannot resolve the user home directory".to_owned()))?;
-    Ok(PathBuf::from(user_home).join(".codex"))
+    user_home()
+        .map(|home| home.join(".codex"))
+        .ok_or_else(|| CliError::Invalid("cannot resolve the user home directory".to_owned()))
 }
 
 fn write_embedded_skill(target: &Path) -> Result<(), CliError> {
@@ -441,24 +404,4 @@ pub enum CliError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-}
-
-pub fn legacy_mcp_arguments<I>(arguments: I) -> Vec<OsString>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut arguments = arguments.into_iter();
-    let executable = arguments
-        .next()
-        .unwrap_or_else(|| OsString::from("oce-client"));
-    let is_legacy = Path::new(&executable)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("oce-client-mcp"));
-    let mut normalized = vec![executable];
-    if is_legacy {
-        normalized.push(OsString::from("mcp"));
-    }
-    normalized.extend(arguments);
-    normalized
 }

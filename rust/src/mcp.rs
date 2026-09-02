@@ -84,11 +84,10 @@ impl McpServer {
         first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
+    /// Handles one JSON-RPC message; notifications (messages without an id) get no reply.
     pub fn handle_message(&self, message: Value) -> Option<Value> {
-        let id = message.get("id").cloned();
+        let id = message.get("id").cloned()?;
         let method = message.get("method").and_then(Value::as_str);
-        id.as_ref()?;
-        let id = id.unwrap_or(Value::Null);
         let result = match method {
             Some("initialize") => self.initialize(message.get("params")),
             Some("ping") | Some("shutdown") => Ok(json!({})),
@@ -151,28 +150,24 @@ impl McpServer {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| RpcError::invalid_params("information_request must not be empty"))?;
-        let workspace = arguments.get("workspace_folder").and_then(|value| {
-            if value.is_null() {
-                None
-            } else {
-                value.as_str()
-            }
-        });
+        let workspace = arguments
+            .get("workspace_folder")
+            .filter(|value| !value.is_null())
+            .and_then(Value::as_str);
         let indexer = self
             .indexer_for(workspace)
             .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-        let payload = match indexer.retrieve(query, self.ready_timeout) {
-            Ok(payload) => payload,
-            Err(error) => {
-                let payload = json!({
+        Ok(match indexer.retrieve(query, self.ready_timeout) {
+            Ok(payload) => tool_result(payload, false),
+            Err(error) => tool_result(
+                json!({
                     "status": "error",
                     "workspace_folder": indexer.root().to_string_lossy(),
                     "error": error.to_string(),
-                });
-                return Ok(tool_result(payload, true));
-            }
-        };
-        Ok(tool_result(payload, false))
+                }),
+                true,
+            ),
+        })
     }
 
     fn indexer_for(&self, workspace: Option<&str>) -> Result<&WorkspaceIndexer, McpError> {
@@ -194,10 +189,6 @@ impl McpServer {
                 requested,
                 allowed: self.indexers.keys().cloned().collect(),
             })
-    }
-
-    pub fn tool_definition(&self) -> Value {
-        tool_definition()
     }
 }
 
@@ -236,7 +227,7 @@ pub fn run_stdio(server: &McpServer) -> Result<(), McpError> {
     run_result.and(stop_result)
 }
 
-fn tool_definition() -> Value {
+pub fn tool_definition() -> Value {
     json!({
         "name": TOOL_NAME,
         "description": TOOL_DESCRIPTION,

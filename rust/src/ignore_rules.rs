@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+const OCEIGNORE_NAME: &str = ".oceignore";
+const GITIGNORE_NAME: &str = ".gitignore";
+
 const DEFAULT_PATTERNS: &[&str] = &[
     "__pycache__/",
     ".pytest_cache/",
@@ -49,15 +52,23 @@ const HARD_PATTERNS: &[&str] = &[
     ".ssh/**",
 ];
 
+/// Whether a path names one of the ignore files whose change requires a full reconcile.
+pub fn is_ignore_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(OCEIGNORE_NAME | GITIGNORE_NAME)
+    )
+}
+
 #[derive(Debug)]
 struct RuleLayer {
     matcher: Gitignore,
 }
 
 impl RuleLayer {
-    fn from_lines(
+    fn from_lines<'a>(
         root: &Path,
-        lines: impl IntoIterator<Item = String>,
+        lines: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, IgnoreError> {
         let mut builder = GitignoreBuilder::new(root);
         for raw in lines {
@@ -98,36 +109,29 @@ pub struct LayeredIgnoreMatcher {
 }
 
 impl LayeredIgnoreMatcher {
-    pub fn new(
-        root: &Path,
-        runtime_patterns: impl IntoIterator<Item = String>,
-    ) -> Result<Self, IgnoreError> {
+    pub fn new(root: &Path, runtime_patterns: &[String]) -> Result<Self, IgnoreError> {
+        let oce_lines = read_lines(root.join(OCEIGNORE_NAME));
+        let git_lines = read_lines(root.join(GITIGNORE_NAME));
         Ok(Self {
-            hard: RuleLayer::from_lines(root, HARD_PATTERNS.iter().map(|v| (*v).to_owned()))?,
-            runtime: RuleLayer::from_lines(root, runtime_patterns)?,
-            oce: RuleLayer::from_lines(root, read_lines(root.join(".oceignore")))?,
-            git: RuleLayer::from_lines(root, read_lines(root.join(".gitignore")))?,
-            defaults: RuleLayer::from_lines(
-                root,
-                DEFAULT_PATTERNS.iter().map(|v| (*v).to_owned()),
-            )?,
+            hard: RuleLayer::from_lines(root, HARD_PATTERNS.iter().copied())?,
+            runtime: RuleLayer::from_lines(root, runtime_patterns.iter().map(String::as_str))?,
+            oce: RuleLayer::from_lines(root, oce_lines.iter().map(String::as_str))?,
+            git: RuleLayer::from_lines(root, git_lines.iter().map(String::as_str))?,
+            defaults: RuleLayer::from_lines(root, DEFAULT_PATTERNS.iter().copied())?,
         })
     }
 
+    /// Decides admission for a normalized, slash-separated workspace-relative path.
     pub fn ignores(&self, path: &str, is_dir: bool) -> bool {
-        let mut normalized = path.replace('\\', "/");
-        while let Some(without_prefix) = normalized.strip_prefix("./") {
-            normalized = without_prefix.to_owned();
-        }
         if self
             .hard
-            .decision(&normalized.to_lowercase(), is_dir)
+            .decision(&path.to_lowercase(), is_dir)
             .is_some_and(|decision| decision)
         {
             return true;
         }
         for layer in [&self.runtime, &self.oce, &self.git, &self.defaults] {
-            if let Some(decision) = layer.decision(&normalized, is_dir) {
+            if let Some(decision) = layer.decision(path, is_dir) {
                 return decision;
             }
         }

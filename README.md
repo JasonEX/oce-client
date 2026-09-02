@@ -45,18 +45,18 @@ oce-client --root /path/to/project status
 oce-client --root /path/to/project retrieve "where is authentication handled?"
 oce-client --root /path/to/project observe src/example.rs --content "unsaved text"
 oce-client --root /path/to/project remove src/obsolete.rs
+oce-client --root /path/to/project list-files
 oce-client --root /path/to/project watch
 ```
 
-`sync`, `status`, `retrieve`, `observe`, and `remove` accept `--json`. Global
-`--root`, `--api-url`, `--state-path`, and repeated `--ignore` options may appear
-before or after the subcommand. `status` is local-only; operations that contact OCE
-use the configured bearer key.
+`sync`, `status`, `list-files`, `retrieve`, `observe`, and `remove` accept `--json`.
+Global `--root`, `--api-url`, `--state-path`, and repeated `--ignore` options may
+appear before or after the subcommand. `status` and `list-files` are local-only;
+`list-files` prints the files a sync would upload. Operations that contact OCE use
+the configured bearer key.
 
-The client stores Rust state at `.oce-client/state-v1.sqlite3` by default. When an
-older Python state database exists, the first Rust run performs a full inventory
-resync if it is safe. It refuses automatic cutover when the old database contains an
-unsaved editor overlay or an uncommitted generation, so local changes are not lost.
+The client stores state at `.oce-client/state-v1.sqlite3` by default and refuses to
+open a state database written with a different schema version.
 
 ## MCP
 
@@ -117,7 +117,9 @@ cargo test --all-targets --locked
 ```
 
 The Python code under `benchmarks/` is development tooling, not a second client
-runtime. It invokes the Rust binary for real synchronization and retrieval:
+runtime. It invokes the Rust binary for synchronization, retrieval, and file
+admission, so even the lexical baseline searches exactly the files the client would
+upload:
 
 ```sh
 uv sync --locked

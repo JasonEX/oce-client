@@ -4,14 +4,20 @@ pub fn calculate_blob_identity(path: &str, content: &str) -> Result<String, Iden
     if path.is_empty() {
         return Err(IdentityError::EmptyPath);
     }
+    Ok(sha256_hex(&[path.as_bytes(), content.as_bytes()]))
+}
+
+/// Hex-encodes the SHA-256 digest of the concatenated parts.
+pub fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
-    digest.update(path.as_bytes());
-    digest.update(content.as_bytes());
-    Ok(digest
+    for part in parts {
+        digest.update(part);
+    }
+    digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

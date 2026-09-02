@@ -161,9 +161,7 @@ fn retrieval_discards_a_result_if_the_workspace_changes_during_the_request() {
     #[cfg(not(unix))]
     let notification_path = path;
 
-    indexer
-        .notify_changes(BTreeSet::from([notification_path]))
-        .expect("notify changed file");
+    indexer.notify_changes(BTreeSet::from([notification_path]));
     api.block_retrieve.store(false, Ordering::Release);
 
     let result = retrieval.join().unwrap();
@@ -191,9 +189,7 @@ fn retrieval_starts_indexing_and_returns_only_after_latest_generation() {
     assert_eq!(first["formatted_retrieval"], "find a:chain:1");
 
     fs::write(root.path().join("a.py"), "two changed").unwrap();
-    indexer
-        .notify_changes(BTreeSet::from([root.path().join("a.py")]))
-        .unwrap();
+    indexer.notify_changes(BTreeSet::from([root.path().join("a.py")]));
     assert_eq!(
         indexer
             .wait_until_ready(Some(Duration::from_secs(1)))

@@ -13,8 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 import bump_version
 import generate_changelog
 
@@ -25,13 +23,6 @@ RELEASE_FILES = [
     "Cargo.lock",
     "CHANGELOG.md",
 ]
-
-
-def _stdout() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
 
 
 def ensure_clean() -> None:
@@ -121,5 +112,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    _stdout()
+    sys.stdout.reconfigure(encoding="utf-8")
     raise SystemExit(main())

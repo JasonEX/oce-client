@@ -8,14 +8,12 @@ use rusqlite::{
 use serde::Serialize;
 
 pub const STATE_SCHEMA_VERSION: i32 = 1;
-pub const LEGACY_STATE_NAME: &str = "state.sqlite3";
-pub const RUST_STATE_NAME: &str = "state-v1.sqlite3";
+pub const STATE_NAME: &str = "state-v1.sqlite3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileStatus {
     Present,
-    Skipped,
     Deleted,
 }
 
@@ -23,7 +21,6 @@ impl FileStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Present => "present",
-            Self::Skipped => "skipped",
             Self::Deleted => "deleted",
         }
     }
@@ -31,7 +28,6 @@ impl FileStatus {
     fn parse(value: &str) -> Result<Self, StateError> {
         match value {
             "present" => Ok(Self::Present),
-            "skipped" => Ok(Self::Skipped),
             "deleted" => Ok(Self::Deleted),
             value => Err(StateError::InvalidValue(format!(
                 "unknown file status {value:?}"
@@ -151,13 +147,10 @@ impl StateStore {
             .map_err(StateError::Sqlite)
     }
 
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StateError> {
-        self.connection()?
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(StateError::Sqlite)
+    /// Current workspace generation without loading the file inventory.
+    pub fn generation(&self) -> Result<i64, StateError> {
+        let connection = self.connection()?;
+        parse_meta_i64(get_meta_from(&connection, "generation")?, 0)
     }
 
     pub fn load_snapshot(&self) -> Result<WorkspaceSnapshot, StateError> {
@@ -205,10 +198,6 @@ impl StateStore {
         })
     }
 
-    pub fn load_records(&self) -> Result<Vec<FileRecord>, StateError> {
-        Ok(self.load_snapshot()?.files.into_values().collect())
-    }
-
     pub fn load_file_content(&self, path: &str) -> Result<Option<String>, StateError> {
         self.connection()?
             .query_row("SELECT content FROM files WHERE path = ?1", [path], |row| {
@@ -223,14 +212,12 @@ impl StateStore {
         let mut connection = self.connection()?;
         let transaction = Self::transaction(&mut connection)?;
         upsert_record(&transaction, record)?;
-        set_meta_in(
-            &transaction,
-            "generation",
-            Some(&record.generation.to_string()),
-        )?;
+        set_meta_in(&transaction, "generation", &record.generation.to_string())?;
         transaction.commit().map_err(StateError::Sqlite)
     }
 
+    /// Upserts `records`, marks `deleted_paths` as deleted, and advances the generation in
+    /// one transaction.
     pub fn apply_file_changes(
         &self,
         records: &[FileRecord],
@@ -255,36 +242,16 @@ impl StateStore {
                 )
                 .map_err(StateError::Sqlite)?;
         }
-        set_meta_in(&transaction, "generation", Some(&generation.to_string()))?;
+        set_meta_in(&transaction, "generation", &generation.to_string())?;
         transaction.commit().map_err(StateError::Sqlite)
     }
 
-    pub fn mark_deleted_paths(&self, paths: &[String], generation: i64) -> Result<(), StateError> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let mut connection = self.connection()?;
-        let transaction = Self::transaction(&mut connection)?;
-        for path in paths {
-            transaction
-                .execute(
-                    "UPDATE files
-                     SET status = 'deleted', blob_name = NULL, content = NULL,
-                         source = 'filesystem', generation = ?1
-                     WHERE path = ?2",
-                    params![generation, path],
-                )
-                .map_err(StateError::Sqlite)?;
-        }
-        set_meta_in(&transaction, "generation", Some(&generation.to_string()))?;
-        transaction.commit().map_err(StateError::Sqlite)
-    }
-
+    /// Records a successful server checkpoint for the inventory at `synced_generation`.
     pub fn commit_sync(
         &self,
         checkpoint_id: &str,
         deleted_paths: &[String],
-        generation: i64,
+        synced_generation: i64,
     ) -> Result<(), StateError> {
         let mut connection = self.connection()?;
         let transaction = Self::transaction(&mut connection)?;
@@ -305,81 +272,22 @@ impl StateStore {
                 .execute("DELETE FROM files WHERE path = ?1", [path])
                 .map_err(StateError::Sqlite)?;
         }
-        set_meta_in(&transaction, "checkpoint_id", Some(checkpoint_id))?;
-        set_meta_in(&transaction, "generation", Some(&generation.to_string()))?;
+        set_meta_in(&transaction, "checkpoint_id", checkpoint_id)?;
         set_meta_in(
             &transaction,
             "synced_generation",
-            Some(&generation.to_string()),
+            &synced_generation.to_string(),
         )?;
         transaction.commit().map_err(StateError::Sqlite)
     }
 }
 
 pub fn default_state_path(root: &Path) -> PathBuf {
-    root.join(".oce-client").join(RUST_STATE_NAME)
+    root.join(".oce-client").join(STATE_NAME)
 }
 
-pub fn legacy_state_path(root: &Path) -> PathBuf {
-    root.join(".oce-client").join(LEGACY_STATE_NAME)
-}
-
-pub fn ensure_legacy_state_is_safe(root: &Path) -> Result<(), StateError> {
-    let path = legacy_state_path(root);
-    if !path.is_file() {
-        return Ok(());
-    }
-    let connection = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(StateError::Sqlite)?;
-    let files_table: Option<i64> = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(StateError::Sqlite)?;
-    if files_table.is_none() {
-        return Ok(());
-    }
-    let explicit_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE source = 'explicit' AND status = 'present'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(StateError::Sqlite)?;
-    if explicit_count > 0 {
-        return Err(StateError::UnsafeLegacyState {
-            path,
-            reason: "the Python state contains an explicit editor overlay; sync or export it before switching to Rust",
-        });
-    }
-    let meta_table: Option<i64> = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(StateError::Sqlite)?;
-    if meta_table.is_some() {
-        let generation = get_meta_from(&connection, "generation")?;
-        let synced = get_meta_from(&connection, "synced_generation")?;
-        if generation.is_some() && generation != synced {
-            return Err(StateError::UnsafeLegacyState {
-                path,
-                reason: "the Python state has an uncommitted generation; run a successful Python sync before switching to Rust",
-            });
-        }
-    }
-    Ok(())
-}
-
-pub fn reject_legacy_schema_at(path: &Path) -> Result<(), StateError> {
+/// Rejects an existing state database whose schema version this client cannot read.
+pub fn ensure_schema_version(path: &Path) -> Result<(), StateError> {
     if !path.is_file() {
         return Ok(());
     }
@@ -410,24 +318,14 @@ fn get_meta_from(connection: &Connection, key: &str) -> Result<Option<String>, S
         .map_err(StateError::Sqlite)
 }
 
-fn set_meta_in(
-    transaction: &Transaction<'_>,
-    key: &str,
-    value: Option<&str>,
-) -> Result<(), StateError> {
-    if let Some(value) = value {
-        transaction
-            .execute(
-                "INSERT INTO meta(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .map_err(StateError::Sqlite)?;
-    } else {
-        transaction
-            .execute("DELETE FROM meta WHERE key = ?1", [key])
-            .map_err(StateError::Sqlite)?;
-    }
+fn set_meta_in(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<(), StateError> {
+    transaction
+        .execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(StateError::Sqlite)?;
     Ok(())
 }
 
@@ -522,10 +420,8 @@ pub enum StateError {
     PoisonedLock,
     #[error("invalid state value: {0}")]
     InvalidValue(String),
-    #[error("cannot switch to Rust client while legacy state {path} is unsafe: {reason}")]
-    UnsafeLegacyState { path: PathBuf, reason: &'static str },
     #[error(
-        "state database {path} uses schema version {found}; Rust client requires version {expected}"
+        "state database {path} uses schema version {found}; this client requires version {expected}"
     )]
     UnsupportedSchema {
         path: PathBuf,

@@ -20,13 +20,6 @@ _SEMVER_RE = re.compile(
 _PARTS = ("major", "minor", "patch")
 
 
-def _stdout() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
-
-
 def read_current_version() -> str:
     with MANIFEST.open("rb") as handle:
         data = tomllib.load(handle)
@@ -129,5 +122,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    _stdout()
+    sys.stdout.reconfigure(encoding="utf-8")
     raise SystemExit(main())

@@ -53,6 +53,14 @@ jobs:
           python-version: "3.13"
           enable-cache: false
 
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Build the client used by the benchmark harness
+        run: cargo build --locked
+
       - name: Install locked development dependencies
         run: uv sync --locked
 

@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -6,7 +5,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 
-use oce_client::cli::legacy_mcp_arguments;
 use oce_client::identity::calculate_blob_identity;
 use serde_json::{Value, json};
 
@@ -121,7 +119,7 @@ fn rust_cli_observe_and_status_preserve_explicit_content_state() {
 }
 
 #[test]
-fn rust_binary_runs_mcp_stdio_and_supports_legacy_argv0() {
+fn rust_binary_runs_mcp_stdio() {
     let root = tempfile::tempdir().unwrap();
     let mut process = clean_command();
     let mut process = process
@@ -171,20 +169,29 @@ fn rust_binary_runs_mcp_stdio_and_supports_legacy_argv0() {
         responses[1]["result"]["tools"][0]["name"],
         "codebase-retrieval"
     );
+}
 
-    let alias = if cfg!(windows) {
-        "oce-client-mcp.exe"
-    } else {
-        "oce-client-mcp"
-    };
-    assert_eq!(
-        legacy_mcp_arguments([OsString::from(alias), OsString::from("--help")]),
-        [
-            OsString::from(alias),
-            OsString::from("mcp"),
-            OsString::from("--help")
-        ]
-    );
+#[test]
+fn rust_list_files_reports_admitted_files_without_a_server() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/a.py"), "print(1)").unwrap();
+    fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+    fs::write(root.path().join("blob.bin"), b"\0\x01").unwrap();
+    let output = clean_command()
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--state-path",
+            root.path().join("state.sqlite3").to_str().unwrap(),
+            "list-files",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["files"], json!(["src/a.py"]));
 }
 
 #[test]

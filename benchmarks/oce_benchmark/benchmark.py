@@ -22,14 +22,13 @@ from .benchmark_lexical import (
     retrieve_lexically,
     ripgrep_version,
 )
-from .filesystem import LocalFileSource
-from .ignore import LayeredIgnoreMatcher
 
 
 ROOT = Path(__file__).resolve().parents[2] / "benchmarks"
 DEFAULT_REPOSITORIES = ROOT / "repositories.json"
 DEFAULT_CASES = ROOT / "cases.jsonl"
 DEFAULT_VARIANTS = ROOT / "variants.json"
+DEFAULT_API_URL = "http://127.0.0.1:8986"
 
 
 @dataclass(frozen=True)
@@ -250,11 +249,15 @@ def resolve_client_binary(configured: str | None = None) -> str:
         raise FileNotFoundError(f"oce-client binary not found: {selected}")
 
     executable_name = "oce-client.exe" if os.name == "nt" else "oce-client"
-    repository_root = ROOT.parent
-    for profile in ("release", "debug"):
-        candidate = repository_root / "target" / profile / executable_name
-        if candidate.is_file():
-            return str(candidate.resolve())
+    local_builds = [
+        candidate
+        for profile in ("release", "debug")
+        if (candidate := ROOT.parent / "target" / profile / executable_name).is_file()
+    ]
+    if local_builds:
+        # Prefer the most recent local build so a stale profile is not picked up.
+        newest = max(local_builds, key=lambda candidate: candidate.stat().st_mtime)
+        return str(newest.resolve())
     if executable := shutil.which("oce-client"):
         return executable
     raise FileNotFoundError(
@@ -265,24 +268,20 @@ def resolve_client_binary(configured: str | None = None) -> str:
 def _run_client_json(
     binary: str,
     root: Path,
-    api_url: str,
-    api_key: str,
     state_path: Path,
     command: Sequence[str],
+    *,
+    api_url: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, object]:
     environment = os.environ.copy()
-    environment["OCE_API_KEY"] = api_key
+    if api_key is not None:
+        environment["OCE_API_KEY"] = api_key
+    arguments = [binary, "--root", str(root), "--state-path", str(state_path)]
+    if api_url is not None:
+        arguments.extend(["--api-url", api_url])
     completed = subprocess.run(
-        [
-            binary,
-            "--root",
-            str(root),
-            "--api-url",
-            api_url,
-            "--state-path",
-            str(state_path),
-            *command,
-        ],
+        [*arguments, *command],
         check=False,
         capture_output=True,
         text=True,
@@ -303,6 +302,15 @@ def _run_client_json(
     if not isinstance(payload, dict):
         raise RuntimeError(f"oce-client {command[0]} returned a non-object payload")
     return payload
+
+
+def _admitted_documents(binary: str, root: Path, state_path: Path) -> dict[str, str]:
+    """Load the files the Rust client would upload, keyed by workspace-relative path."""
+    payload = _run_client_json(binary, root, state_path, ("list-files", "--json"))
+    files = payload.get("files")
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        raise RuntimeError("oce-client list-files returned an invalid payload")
+    return {path: (root / path).read_text(encoding="utf-8") for path in files}
 
 
 def aggregate(results: Sequence[CaseResult]) -> dict[str, object]:
@@ -527,62 +535,123 @@ def _selected_cases(
     return selected
 
 
-def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
-    variant_name = getattr(args, "variant", None)
-    label = getattr(args, "label", None)
-    if bool(variant_name) == bool(label):
-        raise ValueError("provide exactly one of variant or label")
-    variant: BenchmarkVariant | None = None
-    if variant_name:
-        variants = load_variants(getattr(args, "variants", DEFAULT_VARIANTS))
-        try:
-            variant = variants[variant_name]
-        except KeyError as exc:
-            raise ValueError(f"unknown benchmark variant: {variant_name}") from exc
-        label = variant.name
+@dataclass(frozen=True)
+class SelectedCorpus:
+    repositories: dict[str, RepositorySpec]
+    cases: list[BenchmarkCase]
+    all_case_ids: set[str]
+    workdir: Path
 
+    def repository_names(self) -> list[str]:
+        return sorted({case.repository for case in self.cases})
+
+    def root(self, name: str) -> Path:
+        return (self.workdir / name).resolve()
+
+
+def _load_selected_corpus(args: argparse.Namespace) -> SelectedCorpus:
     repositories = load_repositories(args.repositories)
     corpus = load_cases(args.cases)
     cases = _selected_cases(corpus, args)
     workdir = args.workdir.resolve()
     validate_corpus(repositories, cases, workdir)
-    outcomes = _load_outcomes(args.task_outcomes, {case.id for case in corpus})
+    return SelectedCorpus(
+        repositories=repositories,
+        cases=cases,
+        all_case_ids={case.id for case in corpus},
+        workdir=workdir,
+    )
+
+
+def _status_entry(
+    started: float,
+    error: Exception | None = None,
+    **fields: object,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "status": "error" if error is not None else "ok",
+        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+    if error is not None:
+        entry["error_type"] = type(error).__name__
+        entry["error"] = _safe_error_message(error)
+    entry.update(fields)
+    return entry
+
+
+def _result_payload(
+    *,
+    label: str,
+    api_url: str | None,
+    corpus: SelectedCorpus,
+    variant: BenchmarkVariant | None,
+    baseline: dict[str, object] | None,
+    metadata: dict[str, object],
+    sync: dict[str, object],
+    summary: dict[str, object],
+    results: Sequence[CaseResult],
+) -> dict[str, object]:
+    return {
+        "label": label,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "api_url": api_url,
+        "repositories": {
+            name: asdict(corpus.repositories[name])
+            for name in corpus.repository_names()
+        },
+        "variant": asdict(variant) if variant is not None else None,
+        "baseline": baseline,
+        "metadata": metadata,
+        "sync": sync,
+        "summary": summary,
+        "cases": [asdict(item) for item in results],
+    }
+
+
+def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
+    if bool(args.variant) == bool(args.label):
+        raise ValueError("provide exactly one of variant or label")
+    variant: BenchmarkVariant | None = None
+    label = args.label
+    if args.variant:
+        variants = load_variants(args.variants)
+        try:
+            variant = variants[args.variant]
+        except KeyError as exc:
+            raise ValueError(f"unknown benchmark variant: {args.variant}") from exc
+        label = variant.name
+
+    corpus = _load_selected_corpus(args)
+    outcomes = _load_outcomes(args.task_outcomes, corpus.all_case_ids)
     metadata = _parse_key_values(args.metadata)
     prices = _parse_key_values(args.price, numeric=True)
-    api_url = args.api_url or os.environ.get("OCE_API_URL", "http://127.0.0.1:8986")
+    api_url = args.api_url or os.environ.get("OCE_API_URL", DEFAULT_API_URL)
     api_key = os.environ.get("OCE_API_KEY", "sk-opencontextengine")
     admin_key = os.environ.get("OCE_ADMIN_API_KEY")
-    state_context = (
-        tempfile.TemporaryDirectory(prefix="oce-benchmark-")
-        if args.state_dir is None
-        else None
-    )
-    state_dir = (
-        Path(state_context.name)
-        if state_context is not None
-        else args.state_dir.resolve()
-    )
-    state_dir.mkdir(parents=True, exist_ok=True)
-    client_binary = resolve_client_binary(getattr(args, "client_binary", None))
-    state_paths: dict[str, Path] = {}
+    client_binary = resolve_client_binary(args.client_binary)
     sync: dict[str, object] = {}
     sync_errors: dict[str, Exception] = {}
     results: list[CaseResult] = []
     stats_before: dict[str, object] | None = None
     stats_after: dict[str, object] | None = None
-    try:
-        for name in sorted({case.repository for case in cases}):
+    with tempfile.TemporaryDirectory(prefix="oce-benchmark-") as temporary_state:
+        state_dir = (
+            Path(temporary_state) if args.state_dir is None else args.state_dir.resolve()
+        )
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_paths = {
+            name: state_dir / f"{name}.sqlite3" for name in corpus.repository_names()
+        }
+        for name in corpus.repository_names():
             started = time.perf_counter()
             try:
-                state_path = state_dir / f"{name}.sqlite3"
-                state_paths[name] = state_path
                 sync_result = _run_client_json(
                     client_binary,
-                    (workdir / name).resolve(),
-                    api_url,
-                    api_key,
-                    state_path,
+                    corpus.root(name),
+                    state_paths[name],
                     ("sync", "--json"),
+                    api_url=api_url,
+                    api_key=api_key,
                 )
                 uploaded = sync_result.get("uploaded_blob_names")
                 checkpoint_id = sync_result.get("checkpoint_id")
@@ -590,25 +659,19 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
                     raise RuntimeError("oce-client sync returned an invalid payload")
             except Exception as exc:
                 sync_errors[name] = exc
-                sync[name] = {
-                    "status": "error",
-                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                    "error_type": type(exc).__name__,
-                    "error": _safe_error_message(exc),
-                }
+                sync[name] = _status_entry(started, exc)
             else:
-                sync[name] = {
-                    "status": "ok",
-                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                    "uploaded_blobs": len(uploaded),
-                    "checkpoint_id_present": True,
-                }
+                sync[name] = _status_entry(
+                    started,
+                    uploaded_blobs=len(uploaded),
+                    checkpoint_id_present=True,
+                )
 
         if admin_key:
             time.sleep(args.metrics_settle_seconds)
             stats_before = _admin_stats(api_url, admin_key)
 
-        for case in cases:
+        for case in corpus.cases:
             solved = outcomes.get(case.id)
             if error := sync_errors.get(case.repository):
                 results.append(failed_case(case, error, agent_solved=solved))
@@ -616,21 +679,20 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
             try:
                 retrieval = _run_client_json(
                     client_binary,
-                    (workdir / case.repository).resolve(),
-                    api_url,
-                    api_key,
+                    corpus.root(case.repository),
                     state_paths[case.repository],
                     ("retrieve", case.query, "--json"),
+                    api_url=api_url,
+                    api_key=api_key,
                 )
                 formatted = retrieval.get("formatted_retrieval")
                 elapsed_ms = retrieval.get("elapsed_ms")
                 if not isinstance(formatted, str) or not isinstance(elapsed_ms, int):
                     raise RuntimeError("oce-client retrieve returned an invalid payload")
-                paths = parse_retrieved_paths(formatted)
                 results.append(
                     score_case(
                         case,
-                        paths,
+                        parse_retrieved_paths(formatted),
                         returned_chars=len(formatted),
                         elapsed_ms=elapsed_ms,
                         agent_solved=solved,
@@ -642,9 +704,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         if admin_key:
             time.sleep(args.metrics_settle_seconds)
             stats_after = _admin_stats(api_url, admin_key)
-    finally:
-        if state_context is not None:
-            state_context.cleanup()
 
     token_delta = (
         _token_delta(stats_before, stats_after)
@@ -656,69 +715,62 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
     summary["estimated_external_cost"] = (
         _estimate_cost(token_delta, prices) if token_delta is not None else None
     )
-    return {
-        "label": label,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "api_url": api_url,
-        "repositories": {
-            name: asdict(repositories[name])
-            for name in sorted({case.repository for case in cases})
-        },
-        "variant": asdict(variant) if variant is not None else None,
-        "baseline": None,
-        "metadata": metadata,
-        "sync": sync,
-        "summary": summary,
-        "cases": [asdict(item) for item in results],
-    }
+    return _result_payload(
+        label=label,
+        api_url=api_url,
+        corpus=corpus,
+        variant=variant,
+        baseline=None,
+        metadata=metadata,
+        sync=sync,
+        summary=summary,
+        results=results,
+    )
 
 
 def run_lexical_baseline(args: argparse.Namespace) -> dict[str, object]:
-    repositories = load_repositories(args.repositories)
-    corpus = load_cases(args.cases)
-    cases = _selected_cases(corpus, args)
-    workdir = args.workdir.resolve()
-    validate_corpus(repositories, cases, workdir)
+    corpus = _load_selected_corpus(args)
     metadata = _parse_key_values(args.metadata)
     executable = resolve_ripgrep()
     baseline = lexical_baseline_profile(ripgrep_version(executable))
+    client_binary = resolve_client_binary(args.client_binary)
 
     documents: dict[str, dict[str, str]] = {}
     scan_errors: dict[str, Exception] = {}
     sync: dict[str, object] = {}
-    for name in sorted({case.repository for case in cases}):
-        started = time.perf_counter()
-        root = (workdir / name).resolve()
-        try:
-            admitted = LocalFileSource().scan(root, LayeredIgnoreMatcher(root))
-            if not admitted:
-                raise ValueError(f"no admissible benchmark files found: {root}")
-            documents[name] = admitted
-        except Exception as exc:
-            scan_errors[name] = exc
-            sync[name] = {
-                "status": "error",
-                "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                "error_type": type(exc).__name__,
-                "error": _safe_error_message(exc),
-            }
-        else:
-            sync[name] = {
-                "status": "ok",
-                "elapsed_ms": int((time.perf_counter() - started) * 1000),
-                "admitted_files": len(admitted),
-                "admitted_chars": sum(len(content) for content in admitted.values()),
-            }
+    with tempfile.TemporaryDirectory(prefix="oce-benchmark-") as temporary_state:
+        for name in corpus.repository_names():
+            started = time.perf_counter()
+            try:
+                admitted = _admitted_documents(
+                    client_binary,
+                    corpus.root(name),
+                    Path(temporary_state) / f"{name}.sqlite3",
+                )
+                if not admitted:
+                    raise ValueError(
+                        f"no admissible benchmark files found: {corpus.root(name)}"
+                    )
+                documents[name] = admitted
+            except Exception as exc:
+                scan_errors[name] = exc
+                sync[name] = _status_entry(started, exc)
+            else:
+                sync[name] = _status_entry(
+                    started,
+                    admitted_files=len(admitted),
+                    admitted_chars=sum(len(content) for content in admitted.values()),
+                )
 
     results: list[CaseResult] = []
-    for case in cases:
+    for case in corpus.cases:
         if error := scan_errors.get(case.repository):
             results.append(failed_case(case, error))
             continue
         started = time.perf_counter()
         try:
             retrieval = retrieve_lexically(
-                (workdir / case.repository).resolve(),
+                corpus.root(case.repository),
                 documents[case.repository],
                 case.query,
                 executable=executable,
@@ -737,21 +789,17 @@ def run_lexical_baseline(args: argparse.Namespace) -> dict[str, object]:
     summary = aggregate(results)
     summary["external_model_tokens"] = {}
     summary["estimated_external_cost"] = 0.0
-    return {
-        "label": f"ripgrep-lexical-v{baseline['version']}",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "api_url": None,
-        "repositories": {
-            name: asdict(repositories[name])
-            for name in sorted({case.repository for case in cases})
-        },
-        "variant": None,
-        "baseline": baseline,
-        "metadata": metadata,
-        "sync": sync,
-        "summary": summary,
-        "cases": [asdict(item) for item in results],
-    }
+    return _result_payload(
+        label=f"ripgrep-lexical-v{baseline['version']}",
+        api_url=None,
+        corpus=corpus,
+        variant=None,
+        baseline=baseline,
+        metadata=metadata,
+        sync=sync,
+        summary=summary,
+        results=results,
+    )
 
 
 def _format_value(value: object, *, percent: bool = False) -> str:
@@ -816,6 +864,19 @@ def compare_results(paths: Sequence[Path]) -> str:
     return "\n".join(lines)
 
 
+def _add_selection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--workdir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--client-binary",
+        help="oce-client executable (default: OCE_CLIENT_BINARY, local target, or PATH)",
+    )
+    parser.add_argument("--repository", action="append", default=[])
+    parser.add_argument("--category", action="append", default=[])
+    parser.add_argument("--case", action="append", default=[])
+    parser.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the OCE retrieval benchmark")
     parser.add_argument("--repositories", type=Path, default=DEFAULT_REPOSITORIES)
@@ -839,25 +900,13 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser(
         "run", help="sync workspaces and execute retrieval cases"
     )
-    run.add_argument("--workdir", type=Path, required=True)
-    run.add_argument("--output", type=Path, required=True)
+    _add_selection_arguments(run)
     identity = run.add_mutually_exclusive_group(required=True)
     identity.add_argument("--variant", help="checked-in diagnostic configuration")
-    identity.add_argument(
-        "--label",
-        help="ad hoc configuration label",
-    )
+    identity.add_argument("--label", help="ad hoc configuration label")
     run.add_argument("--api-url")
-    run.add_argument(
-        "--client-binary",
-        help="oce-client executable (default: OCE_CLIENT_BINARY, local target, or PATH)",
-    )
     run.add_argument("--state-dir", type=Path)
-    run.add_argument("--repository", action="append", default=[])
-    run.add_argument("--category", action="append", default=[])
-    run.add_argument("--case", action="append", default=[])
     run.add_argument("--task-outcomes", type=Path)
-    run.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument(
         "--price",
         action="append",
@@ -870,21 +919,20 @@ def build_parser() -> argparse.ArgumentParser:
         "baseline",
         help="run the deterministic no-model ripgrep lexical baseline",
     )
-    baseline.add_argument("--workdir", type=Path, required=True)
-    baseline.add_argument("--output", type=Path, required=True)
-    baseline.add_argument("--repository", action="append", default=[])
-    baseline.add_argument("--category", action="append", default=[])
-    baseline.add_argument("--case", action="append", default=[])
-    baseline.add_argument(
-        "--metadata",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-    )
+    _add_selection_arguments(baseline)
 
     compare = subparsers.add_parser("compare", help="render a Markdown variant table")
     compare.add_argument("results", nargs="+", type=Path)
     return parser
+
+
+def _write_result(output: Path, payload: dict[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -926,22 +974,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         if args.metrics_settle_seconds < 0:
             raise ValueError("metrics-settle-seconds must not be negative")
-        payload = run_benchmark(args)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
+        _write_result(args.output, run_benchmark(args))
         return 0
     if args.command == "baseline":
-        payload = run_lexical_baseline(args)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        print(json.dumps(payload["summary"], ensure_ascii=False, sort_keys=True))
+        _write_result(args.output, run_lexical_baseline(args))
         return 0
     if args.command == "compare":
         print(compare_results(args.results))

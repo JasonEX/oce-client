@@ -1,21 +1,22 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::context::{ContextError, WorkspaceContext};
-use crate::filesystem::normalize_workspace_event_path;
-use crate::ignore_rules::LayeredIgnoreMatcher;
+use crate::context::WorkspaceContext;
+use crate::filesystem::{normalize_workspace_event_path, relative_path_string};
+use crate::ignore_rules::{LayeredIgnoreMatcher, is_ignore_file};
 use crate::watcher::{WatchError, WatchHandle};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Readiness {
     Ready,
+    #[default]
     Indexing,
     Error,
 }
@@ -64,7 +65,7 @@ struct IndexerInner {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Control {
     started: bool,
     stop: bool,
@@ -78,20 +79,44 @@ struct Control {
     last_error: Option<String>,
 }
 
-impl Default for Control {
-    fn default() -> Self {
-        Self {
-            started: false,
-            stop: false,
-            state: Readiness::Indexing,
-            requested_generation: 0,
-            synced_generation: 0,
-            initialized: false,
-            recovery_required: false,
-            full_pending: false,
-            pending_paths: BTreeSet::new(),
-            last_error: None,
-        }
+/// Work handed from the control state to the worker thread.
+struct Batch {
+    full: bool,
+    paths: BTreeSet<PathBuf>,
+    generation: u64,
+}
+
+impl Control {
+    fn idle(&self) -> bool {
+        !self.full_pending && self.pending_paths.is_empty()
+    }
+
+    fn ready(&self) -> bool {
+        self.initialized
+            && self.state == Readiness::Ready
+            && self.idle()
+            && self.synced_generation >= self.requested_generation
+    }
+
+    /// The first full synchronization has neither completed nor been scheduled.
+    fn needs_initial_sync(&self) -> bool {
+        !self.initialized && !self.full_pending
+    }
+
+    /// A failed synchronization has nothing scheduled that would retry it.
+    fn needs_recovery(&self) -> bool {
+        self.state == Readiness::Error && self.idle()
+    }
+
+    fn request_full(&mut self) -> Result<(), IndexerError> {
+        self.requested_generation = self
+            .requested_generation
+            .checked_add(1)
+            .ok_or(IndexerError::GenerationOverflow)?;
+        self.full_pending = true;
+        self.state = Readiness::Indexing;
+        self.last_error = None;
+        Ok(())
     }
 }
 
@@ -121,13 +146,8 @@ impl WorkspaceIndexer {
         {
             let mut control = self.control()?;
             if control.started {
-                if initial_sync
-                    && !control.initialized
-                    && matches!(control.state, Readiness::Indexing | Readiness::Error)
-                    && !control.full_pending
-                    && control.pending_paths.is_empty()
-                {
-                    request_full(&mut control)?;
+                if initial_sync && control.needs_initial_sync() {
+                    control.request_full()?;
                     self.inner.condition.notify_all();
                 }
                 return Ok(());
@@ -159,20 +179,12 @@ impl WorkspaceIndexer {
             ))
             .spawn(move || run_worker(weak))
             .map_err(IndexerError::Thread)?;
-        *self
-            .inner
-            .watch
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)? = Some(watch);
-        *self
-            .inner
-            .worker
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)? = Some(worker);
+        *lock(&self.inner.watch)? = Some(watch);
+        *lock(&self.inner.worker)? = Some(worker);
         let mut control = self.control()?;
         control.started = true;
         if initial_sync {
-            request_full(&mut control)?;
+            control.request_full()?;
         }
         self.inner.condition.notify_all();
         Ok(())
@@ -187,40 +199,19 @@ impl WorkspaceIndexer {
             control.stop = true;
             self.inner.condition.notify_all();
         }
-        if let Some(mut watch) = self
-            .inner
-            .watch
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)?
-            .take()
-        {
+        if let Some(mut watch) = lock(&self.inner.watch)?.take() {
             watch.stop();
             watch.join()?;
         }
-        if let Some(worker) = self
-            .inner
-            .worker
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)?
-            .take()
-        {
+        if let Some(worker) = lock(&self.inner.worker)?.take() {
             worker.join().map_err(|_| IndexerError::WorkerPanicked)?;
         }
-        let mut control = self.control()?;
-        control.started = false;
+        self.control()?.started = false;
         Ok(())
     }
 
-    pub fn request_full_sync(&self) -> Result<(), IndexerError> {
-        let mut control = self.control()?;
-        request_full(&mut control)?;
-        self.inner.condition.notify_all();
-        Ok(())
-    }
-
-    pub fn notify_changes(&self, paths: BTreeSet<PathBuf>) -> Result<(), IndexerError> {
+    pub fn notify_changes(&self, paths: BTreeSet<PathBuf>) {
         self.inner.notify_changes(paths);
-        Ok(())
     }
 
     pub fn wait_until_ready(&self, timeout: Option<Duration>) -> Result<Readiness, IndexerError> {
@@ -229,49 +220,38 @@ impl WorkspaceIndexer {
         if !control.started {
             return Err(IndexerError::NotStarted);
         }
-        if !control.initialized
-            && matches!(control.state, Readiness::Indexing | Readiness::Error)
-            && !control.full_pending
-        {
-            request_full(&mut control)?;
+        if control.needs_initial_sync() {
+            control.request_full()?;
             self.inner.condition.notify_all();
         }
         loop {
             if self.inner.watch_error()?.is_some() {
                 return Ok(Readiness::Error);
             }
-            if ready(&control) {
+            if control.ready() {
                 return Ok(Readiness::Ready);
             }
-            if control.state == Readiness::Error
-                && !control.full_pending
-                && control.pending_paths.is_empty()
-            {
+            if control.needs_recovery() {
                 return Ok(Readiness::Error);
             }
-            if let Some(deadline) = deadline {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    return Ok(Readiness::Indexing);
-                };
-                if remaining.is_zero() {
-                    return Ok(Readiness::Indexing);
+            control = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(Readiness::Indexing);
+                    }
+                    self.inner
+                        .condition
+                        .wait_timeout(control, remaining)
+                        .map_err(|_| IndexerError::PoisonedLock)?
+                        .0
                 }
-                let (next, result) = self
-                    .inner
-                    .condition
-                    .wait_timeout(control, remaining)
-                    .map_err(|_| IndexerError::PoisonedLock)?;
-                control = next;
-                if result.timed_out() && !ready(&control) {
-                    return Ok(Readiness::Indexing);
-                }
-            } else {
-                control = self
+                None => self
                     .inner
                     .condition
                     .wait(control)
-                    .map_err(|_| IndexerError::PoisonedLock)?;
-            }
+                    .map_err(|_| IndexerError::PoisonedLock)?,
+            };
         }
     }
 
@@ -279,12 +259,8 @@ impl WorkspaceIndexer {
         self.start(true)?;
         {
             let mut control = self.control()?;
-            if control.state == Readiness::Error
-                && self.inner.watch_error()?.is_none()
-                && !control.full_pending
-                && control.pending_paths.is_empty()
-            {
-                request_full(&mut control)?;
+            if control.needs_recovery() && self.inner.watch_error()?.is_none() {
+                control.request_full()?;
                 self.inner.condition.notify_all();
             }
         }
@@ -293,10 +269,7 @@ impl WorkspaceIndexer {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let status = self.wait_until_ready(Some(remaining))?;
             if status != Readiness::Ready {
-                let mut payload = json!({
-                    "status": status.as_str(),
-                    "workspace_folder": self.inner.root.to_string_lossy(),
-                });
+                let mut payload = self.payload(status.as_str());
                 if status == Readiness::Error {
                     payload["error"] = Value::String(
                         self.inner
@@ -312,47 +285,38 @@ impl WorkspaceIndexer {
                 return Ok(payload);
             }
 
-            let context = self
-                .inner
-                .context
-                .lock()
-                .map_err(|_| IndexerError::PoisonedLock)?;
+            // Retrieve against the generation observed while ready, then discard the result
+            // if the workspace moved on during the request.
+            let context = lock(&self.inner.context)?;
             let generation = {
                 let control = self.control()?;
-                if !ready(&control) || self.inner.watch_error()?.is_some() {
-                    drop(control);
-                    drop(context);
+                if !control.ready() || self.inner.watch_error()?.is_some() {
                     continue;
                 }
                 control.requested_generation
             };
-            let result = context.retrieve(query, "workspace");
+            let result = context.retrieve(query);
             drop(context);
             let control = self.control()?;
-            if !ready(&control)
+            if !control.ready()
                 || control.requested_generation != generation
                 || self.inner.watch_error()?.is_some()
             {
-                drop(control);
                 continue;
             }
-            match result {
+            return Ok(match result {
                 Ok(result) => {
-                    return Ok(json!({
-                        "status": "ready",
-                        "workspace_folder": self.inner.root.to_string_lossy(),
-                        "formatted_retrieval": result.formatted_retrieval,
-                        "elapsed_ms": result.elapsed_ms,
-                    }));
+                    let mut payload = self.payload("ready");
+                    payload["formatted_retrieval"] = Value::String(result.formatted_retrieval);
+                    payload["elapsed_ms"] = Value::from(result.elapsed_ms);
+                    payload
                 }
                 Err(error) => {
-                    return Ok(json!({
-                        "status": "error",
-                        "workspace_folder": self.inner.root.to_string_lossy(),
-                        "error": error.to_string(),
-                    }));
+                    let mut payload = self.payload("error");
+                    payload["error"] = Value::String(error.to_string());
+                    payload
                 }
-            }
+            });
         }
     }
 
@@ -372,17 +336,25 @@ impl WorkspaceIndexer {
         })
     }
 
-    fn control(&self) -> Result<std::sync::MutexGuard<'_, Control>, IndexerError> {
-        self.inner
-            .control
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)
+    fn payload(&self, status: &str) -> Value {
+        json!({
+            "status": status,
+            "workspace_folder": self.inner.root.to_string_lossy(),
+        })
     }
+
+    fn control(&self) -> Result<MutexGuard<'_, Control>, IndexerError> {
+        lock(&self.inner.control)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, IndexerError> {
+    mutex.lock().map_err(|_| IndexerError::PoisonedLock)
 }
 
 impl IndexerInner {
     fn notify_changes(&self, paths: BTreeSet<PathBuf>) {
-        let matcher = match LayeredIgnoreMatcher::new(&self.root, self.runtime_patterns.clone()) {
+        let matcher = match LayeredIgnoreMatcher::new(&self.root, &self.runtime_patterns) {
             Ok(matcher) => matcher,
             Err(error) => {
                 self.record_error(error.to_string());
@@ -390,20 +362,22 @@ impl IndexerInner {
             }
         };
         let mut relevant = BTreeSet::new();
+        let mut ignore_rules_changed = false;
         for path in paths {
             let Some(normalized) = normalize_workspace_event_path(&self.root, &path) else {
                 continue;
             };
-            let relative = normalized
+            let Some(relative) = normalized
                 .strip_prefix(&self.root)
-                .expect("normalized event path must remain within the workspace")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let is_ignore_file = matches!(
-                normalized.file_name().and_then(|name| name.to_str()),
-                Some(".gitignore" | ".oceignore")
-            );
-            if is_ignore_file || !matcher.ignores(&relative, normalized.is_dir()) {
+                .ok()
+                .and_then(relative_path_string)
+            else {
+                continue;
+            };
+            if is_ignore_file(&normalized) {
+                ignore_rules_changed = true;
+                relevant.insert(normalized);
+            } else if !matcher.ignores(&relative, normalized.is_dir()) {
                 relevant.insert(normalized);
             }
         }
@@ -423,15 +397,7 @@ impl IndexerInner {
             return;
         };
         control.requested_generation = generation;
-        let needs_full = !control.initialized
-            || control.recovery_required
-            || relevant.iter().any(|path| {
-                matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some(".gitignore" | ".oceignore")
-                )
-            });
-        if needs_full {
+        if !control.initialized || control.recovery_required || ignore_rules_changed {
             control.full_pending = true;
         } else {
             control.pending_paths.extend(relevant);
@@ -451,12 +417,7 @@ impl IndexerInner {
     }
 
     fn watch_error(&self) -> Result<Option<String>, IndexerError> {
-        Ok(self
-            .watch
-            .lock()
-            .map_err(|_| IndexerError::PoisonedLock)?
-            .as_ref()
-            .and_then(WatchHandle::error))
+        Ok(lock(&self.watch)?.as_ref().and_then(WatchHandle::error))
     }
 }
 
@@ -469,7 +430,7 @@ fn run_worker(weak: Weak<IndexerInner>) {
             let Ok(mut control) = inner.control.lock() else {
                 return;
             };
-            while !control.stop && !control.full_pending && control.pending_paths.is_empty() {
+            while !control.stop && control.idle() {
                 let Ok(next) = inner.condition.wait(control) else {
                     return;
                 };
@@ -478,27 +439,25 @@ fn run_worker(weak: Weak<IndexerInner>) {
             if control.stop {
                 return;
             }
-            let full = control.full_pending;
-            let paths = std::mem::take(&mut control.pending_paths);
-            let generation = control.requested_generation;
+            let batch = Batch {
+                full: control.full_pending,
+                paths: std::mem::take(&mut control.pending_paths),
+                generation: control.requested_generation,
+            };
             control.full_pending = false;
             control.state = Readiness::Indexing;
-            (full, paths, generation)
+            batch
         };
-        let result = inner
-            .context
-            .lock()
-            .map_err(|_| ContextErrorText("workspace context lock is poisoned".to_owned()))
-            .and_then(|context| {
-                if batch.0 {
-                    context.sync().map(|_| ()).map_err(ContextErrorText::from)
-                } else {
-                    context
-                        .sync_paths(batch.1)
-                        .map(|_| ())
-                        .map_err(ContextErrorText::from)
-                }
-            });
+        let result = match inner.context.lock() {
+            Err(_) => Err("workspace context lock is poisoned".to_owned()),
+            Ok(context) => if batch.full {
+                context.sync()
+            } else {
+                context.sync_paths(batch.paths)
+            }
+            .map(drop)
+            .map_err(|error| error.to_string()),
+        };
         let Ok(mut control) = inner.control.lock() else {
             return;
         };
@@ -506,52 +465,25 @@ fn run_worker(weak: Weak<IndexerInner>) {
             Ok(()) => {
                 control.initialized = true;
                 control.recovery_required = false;
-                control.synced_generation = control.synced_generation.max(batch.2);
+                control.synced_generation = control.synced_generation.max(batch.generation);
                 control.last_error = None;
-                control.state = if control.full_pending || !control.pending_paths.is_empty() {
-                    Readiness::Indexing
-                } else {
+                control.state = if control.idle() {
                     Readiness::Ready
+                } else {
+                    Readiness::Indexing
                 };
             }
             Err(error) => {
                 control.recovery_required = true;
-                if control.full_pending || !control.pending_paths.is_empty() {
+                if !control.idle() {
                     control.full_pending = true;
                     control.pending_paths.clear();
                 }
                 control.state = Readiness::Error;
-                control.last_error = Some(error.0);
+                control.last_error = Some(error);
             }
         }
         inner.condition.notify_all();
-    }
-}
-
-fn request_full(control: &mut Control) -> Result<(), IndexerError> {
-    control.requested_generation = control
-        .requested_generation
-        .checked_add(1)
-        .ok_or(IndexerError::GenerationOverflow)?;
-    control.full_pending = true;
-    control.state = Readiness::Indexing;
-    control.last_error = None;
-    Ok(())
-}
-
-fn ready(control: &Control) -> bool {
-    control.initialized
-        && control.state == Readiness::Ready
-        && !control.full_pending
-        && control.pending_paths.is_empty()
-        && control.synced_generation >= control.requested_generation
-}
-
-struct ContextErrorText(String);
-
-impl From<ContextError> for ContextErrorText {
-    fn from(error: ContextError) -> Self {
-        Self(error.to_string())
     }
 }
 

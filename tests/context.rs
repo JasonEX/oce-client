@@ -242,7 +242,7 @@ fn rust_retrieve_recovers_checkpoint_lost_after_sync() {
         state.checkpoint_members.clear();
     }
 
-    let result = context.retrieve("find a", "workspace").expect("retrieve");
+    let result = context.retrieve("find a").expect("retrieve");
     assert!(result.formatted_retrieval.starts_with("find a:chain:"));
     assert_eq!(
         context.snapshot().unwrap().checkpoint_id,
@@ -286,6 +286,31 @@ fn rust_explicit_overlay_survives_disk_reconcile() {
         context.snapshot().unwrap().files["a.py"].status,
         FileStatus::Deleted
     );
+}
+
+#[test]
+fn rust_explicit_overlay_survives_unreadable_disk_file() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("a.py");
+    fs::write(&path, "disk").unwrap();
+    let api = Arc::new(FakeApi::default());
+    let context = context(root.path(), api);
+    context
+        .observe_file(Path::new("a.py"), "unsaved")
+        .expect("observe overlay");
+
+    fs::write(&path, b"bin\0ary").unwrap();
+    context.reconcile().expect("full reconcile");
+    assert_eq!(
+        context.snapshot().unwrap().files["a.py"].source,
+        FileSource::Explicit
+    );
+    context
+        .reconcile_paths([path])
+        .expect("incremental reconcile");
+    let record = &context.snapshot().unwrap().files["a.py"];
+    assert_eq!(record.source, FileSource::Explicit);
+    assert_eq!(record.content.as_deref(), Some("unsaved"));
 }
 
 #[test]

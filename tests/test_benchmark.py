@@ -221,6 +221,7 @@ def test_run_preserves_sync_failures_as_case_errors(tmp_path, monkeypatch):
     args = SimpleNamespace(
         repositories=repositories,
         cases=cases,
+        variants=None,
         repository=[],
         category=[],
         case=[],
@@ -246,7 +247,7 @@ def test_run_preserves_sync_failures_as_case_errors(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
-def test_run_lexical_baseline_uses_admitted_files_and_needs_no_server(
+def test_run_lexical_baseline_uses_client_admission_and_needs_no_server(
     tmp_path, monkeypatch
 ):
     repositories = tmp_path / "repositories.json"
@@ -299,6 +300,7 @@ def test_run_lexical_baseline_uses_admitted_files_and_needs_no_server(
         case=[],
         workdir=workdir,
         metadata=[],
+        client_binary=None,
     )
 
     payload = run_lexical_baseline(args)

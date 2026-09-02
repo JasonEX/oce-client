@@ -39,13 +39,6 @@ _CHANGELOG_HEADER = (
 _UNRELEASED = "## [Unreleased]\n\n"
 
 
-def _stdout() -> None:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
-
-
 def git_log(since: str | None, to: str) -> list[tuple[str, str, str]]:
     format_string = "%H%x1f%s%x1f%b%x1e"
     revision = to if since is None else f"{since}..{to}"
@@ -183,5 +176,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    _stdout()
+    sys.stdout.reconfigure(encoding="utf-8")
     raise SystemExit(main())

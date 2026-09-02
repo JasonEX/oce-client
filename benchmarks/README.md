@@ -44,9 +44,10 @@ uv run python benchmarks/evaluate.py baseline \
   --output /tmp/oce-results/ripgrep-lexical-v1.json
 ```
 
-This command requires `rg` but no OCE server, API key, embedding model, or LLM. It reuses
-the benchmark's conservative file admission rules. Ripgrep searches only that admitted
-file list; fixed lexical rules rank matches and pack at most ten bounded 1,600-character
+This command requires `rg` and a built `oce-client` binary, but no OCE server, API key,
+embedding model, or LLM. It asks the client for the admitted file list (`list-files`), so
+the baseline searches exactly the files a sync would upload. Ripgrep searches only that
+list; fixed lexical rules rank matches and pack at most ten bounded 1,600-character
 excerpts. The result records the algorithm and ripgrep versions, and reports zero external
 model tokens and cost.
 

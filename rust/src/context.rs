@@ -7,20 +7,23 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::filesystem::{FileAdmissionError, LocalFileSource, normalize_workspace_event_path};
+use crate::filesystem::{
+    FileAdmissionError, LocalFileSource, lexical_normalize, modified_ns,
+    normalize_workspace_event_path, relative_path_string,
+};
 use crate::http::{ApiError, BlobApi, BlobUpload, RetrievalResult};
 use crate::identity::{IdentityError, calculate_blob_identity};
-use crate::ignore_rules::{IgnoreError, LayeredIgnoreMatcher};
+use crate::ignore_rules::{IgnoreError, LayeredIgnoreMatcher, is_ignore_file};
 use crate::state::{
     FileRecord, FileSource, FileStatus, StateError, StateStore, WorkspaceSnapshot,
-    default_state_path, ensure_legacy_state_is_safe, reject_legacy_schema_at,
+    default_state_path, ensure_schema_version,
 };
 
-const DEFAULT_READY_POLL_ATTEMPTS: usize = 20;
-const DEFAULT_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DEFAULT_MAX_FIND_MISSING: usize = 1000;
-const DEFAULT_MAX_UPLOAD_BLOBS: usize = 1000;
-const DEFAULT_MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+const READY_POLL_ATTEMPTS: usize = 20;
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_FIND_MISSING: usize = 1000;
+const MAX_UPLOAD_BLOBS: usize = 1000;
+const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncResult {
@@ -30,24 +33,12 @@ pub struct SyncResult {
     pub deleted_blobs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SyncPlan {
-    checkpoint_id: Option<String>,
-    added_blobs: Vec<String>,
-    deleted_blobs: Vec<String>,
-}
-
 pub struct WorkspaceContext {
     root: PathBuf,
     api: Arc<dyn BlobApi>,
     state: StateStore,
     file_source: LocalFileSource,
     runtime_patterns: Vec<String>,
-    ready_poll_attempts: usize,
-    ready_poll_interval: Duration,
-    max_find_missing: usize,
-    max_upload_blobs: usize,
-    max_upload_bytes: usize,
 }
 
 impl std::fmt::Debug for WorkspaceContext {
@@ -76,11 +67,10 @@ impl WorkspaceContext {
         if !root.is_dir() {
             return Err(ContextError::NotDirectory(root));
         }
-        ensure_legacy_state_is_safe(&root)?;
         let state_path = state_path
             .map(Path::to_path_buf)
             .unwrap_or_else(|| default_state_path(&root));
-        reject_legacy_schema_at(&state_path)?;
+        ensure_schema_version(&state_path)?;
         let state = StateStore::open(&state_path)?;
         Ok(Self {
             root,
@@ -88,27 +78,11 @@ impl WorkspaceContext {
             state,
             file_source: LocalFileSource::default(),
             runtime_patterns,
-            ready_poll_attempts: DEFAULT_READY_POLL_ATTEMPTS,
-            ready_poll_interval: DEFAULT_READY_POLL_INTERVAL,
-            max_find_missing: DEFAULT_MAX_FIND_MISSING,
-            max_upload_blobs: DEFAULT_MAX_UPLOAD_BLOBS,
-            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
         })
-    }
-
-    #[doc(hidden)]
-    pub fn with_polling(mut self, attempts: usize, interval: Duration) -> Self {
-        self.ready_poll_attempts = attempts;
-        self.ready_poll_interval = interval;
-        self
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn state_path(&self) -> &Path {
-        self.state.path()
     }
 
     pub fn runtime_patterns(&self) -> &[String] {
@@ -116,34 +90,38 @@ impl WorkspaceContext {
     }
 
     fn matcher(&self) -> Result<LayeredIgnoreMatcher, ContextError> {
-        LayeredIgnoreMatcher::new(&self.root, self.runtime_patterns.clone()).map_err(Into::into)
+        LayeredIgnoreMatcher::new(&self.root, &self.runtime_patterns).map_err(Into::into)
     }
 
     fn next_generation(&self) -> Result<i64, ContextError> {
-        self.snapshot()?
-            .generation
+        self.state
+            .generation()?
             .checked_add(1)
             .ok_or(ContextError::GenerationOverflow)
     }
 
+    /// Converts a user-supplied path into the workspace-relative record key.
     pub fn normalize_path(&self, path: &Path) -> Result<String, ContextError> {
+        let invalid = || ContextError::InvalidRelativePath(path.to_path_buf());
         let relative = if path.is_absolute() {
-            let normalized = normalize_absolute(path)?;
+            let normalized = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => lexical_normalize(path).ok_or_else(invalid)?,
+            };
             normalized
                 .strip_prefix(&self.root)
                 .map(Path::to_path_buf)
                 .map_err(|_| ContextError::OutsideWorkspace(path.to_path_buf()))?
         } else {
-            normalize_lexical_relative(path)?
+            if path
+                .components()
+                .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+            {
+                return Err(invalid());
+            }
+            lexical_normalize(path).ok_or_else(invalid)?
         };
-        let mut normalized = relative.to_string_lossy().replace('\\', "/");
-        while let Some(value) = normalized.strip_prefix("./") {
-            normalized = value.to_owned();
-        }
-        if normalized.is_empty() || normalized == "." || normalized.starts_with("../") {
-            return Err(ContextError::InvalidRelativePath(path.to_path_buf()));
-        }
-        Ok(normalized)
+        relative_path_string(&relative).ok_or_else(invalid)
     }
 
     pub fn observe_file(&self, path: &Path, content: &str) -> Result<(), ContextError> {
@@ -181,30 +159,67 @@ impl WorkspaceContext {
     pub fn remove_file(&self, path: &Path) -> Result<(), ContextError> {
         let normalized = self.normalize_path(path)?;
         let generation = self.next_generation()?;
-        self.state.mark_deleted_paths(&[normalized], generation)?;
+        self.state
+            .apply_file_changes(&[], &[normalized], generation)?;
         Ok(())
+    }
+
+    /// Lists the workspace-relative paths a sync would upload, without contacting the server.
+    pub fn admitted_files(&self) -> Result<Vec<String>, ContextError> {
+        let matcher = self.matcher()?;
+        Ok(self
+            .file_source
+            .discover(&self.root, &matcher)?
+            .into_iter()
+            .filter(|file| self.file_source.read_within(&self.root, &file.path).is_ok())
+            .map(|file| file.relative_path)
+            .collect())
+    }
+
+    /// Builds the record for an admitted filesystem path. Returns the explicit overlay when
+    /// one exists and differs from disk, and `None` when the file cannot be read and no
+    /// overlay protects it.
+    fn filesystem_record(
+        &self,
+        relative: &str,
+        source_path: &Path,
+        current: &WorkspaceSnapshot,
+        generation: i64,
+    ) -> Result<Option<FileRecord>, ContextError> {
+        let existing = current.files.get(relative);
+        let overlay = existing.filter(|record| {
+            record.source == FileSource::Explicit && record.status == FileStatus::Present
+        });
+        let Ok((content, metadata)) = self.file_source.read_within(&self.root, source_path) else {
+            return Ok(overlay.cloned());
+        };
+        let blob_name = calculate_blob_identity(relative, &content)?;
+        if let Some(overlay) = overlay
+            && overlay.blob_name.as_deref() != Some(&blob_name)
+        {
+            return Ok(Some(overlay.clone()));
+        }
+        Ok(Some(FileRecord {
+            path: relative.to_owned(),
+            blob_name: Some(blob_name),
+            committed_blob_name: existing.and_then(|record| record.committed_blob_name.clone()),
+            status: FileStatus::Present,
+            content: Some(content),
+            size: metadata.len(),
+            modified_ns: modified_ns(&metadata),
+            source: FileSource::Filesystem,
+            generation,
+        }))
     }
 
     pub fn reconcile(&self) -> Result<WorkspaceSnapshot, ContextError> {
         let generation = self.next_generation()?;
         let current = self.snapshot()?;
-        let explicit = current
-            .files
-            .iter()
-            .filter(|(_, record)| {
-                record.source == FileSource::Explicit && record.status == FileStatus::Present
-            })
-            .map(|(path, record)| (path.clone(), record.clone()))
-            .collect::<BTreeMap<_, _>>();
         let matcher = self.matcher()?;
-        let discovered = self.file_source.discover(&self.root, &matcher)?;
         let mut records = Vec::new();
         let mut known_paths = BTreeSet::new();
-        let mut scanned_paths = BTreeSet::new();
-
-        for file in discovered {
+        for file in self.file_source.discover(&self.root, &matcher)? {
             let path = file.relative_path;
-            scanned_paths.insert(path.clone());
             if let Some(existing) = current.files.get(&path)
                 && existing.source == FileSource::Filesystem
                 && existing.status == FileStatus::Present
@@ -212,59 +227,27 @@ impl WorkspaceContext {
                 && existing.modified_ns == file.modified_ns
                 && existing.size == file.size
             {
-                known_paths.insert(path.clone());
+                known_paths.insert(path);
                 records.push(FileRecord {
-                    path,
-                    blob_name: existing.blob_name.clone(),
-                    committed_blob_name: existing.committed_blob_name.clone(),
-                    status: FileStatus::Present,
                     content: None,
-                    size: existing.size,
-                    modified_ns: existing.modified_ns,
-                    source: FileSource::Filesystem,
                     generation,
+                    ..existing.clone()
                 });
                 continue;
             }
-
-            let content = match self.file_source.read_within(&self.root, &file.path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let metadata = match fs::metadata(&file.path) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            let blob_name = calculate_blob_identity(&path, &content)?;
-            if let Some(overlay) = explicit.get(&path)
-                && overlay.blob_name.as_deref() != Some(&blob_name)
-            {
-                records.push(overlay.clone());
+            if let Some(record) = self.filesystem_record(&path, &file.path, &current, generation)? {
                 known_paths.insert(path);
-                continue;
+                records.push(record);
             }
-            known_paths.insert(path.clone());
-            let committed_blob_name = current
-                .files
-                .get(&path)
-                .and_then(|record| record.committed_blob_name.clone());
-            records.push(FileRecord {
-                path,
-                blob_name: Some(blob_name),
-                committed_blob_name,
-                status: FileStatus::Present,
-                content: Some(content),
-                size: metadata.len(),
-                modified_ns: metadata_modified_ns(&metadata),
-                source: FileSource::Filesystem,
-                generation,
-            });
         }
-
-        for (path, overlay) in explicit {
-            if !scanned_paths.contains(&path) {
-                known_paths.insert(path);
-                records.push(overlay);
+        // Explicit overlays without a matching disk file remain durable.
+        for (path, record) in &current.files {
+            if record.source == FileSource::Explicit
+                && record.status == FileStatus::Present
+                && !known_paths.contains(path)
+            {
+                known_paths.insert(path.clone());
+                records.push(record.clone());
             }
         }
         let missing_paths = current
@@ -282,23 +265,18 @@ impl WorkspaceContext {
         &self,
         changed_paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<WorkspaceSnapshot, ContextError> {
-        let mut resolved = BTreeSet::new();
-        for path in changed_paths {
-            if let Some(normalized) = normalize_workspace_event_path(&self.root, &path) {
-                resolved.insert(normalized);
-            }
-        }
+        let resolved = changed_paths
+            .into_iter()
+            .filter_map(|path| normalize_workspace_event_path(&self.root, &path))
+            .collect::<BTreeSet<_>>();
         if resolved.is_empty() {
             return self.snapshot();
         }
-        for path in &resolved {
-            if matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some(".gitignore" | ".oceignore")
-            ) || path.is_dir()
-            {
-                return self.reconcile();
-            }
+        if resolved
+            .iter()
+            .any(|path| is_ignore_file(path) || path.is_dir())
+        {
+            return self.reconcile();
         }
 
         let generation = self.next_generation()?;
@@ -307,69 +285,39 @@ impl WorkspaceContext {
         let mut records = Vec::new();
         let mut deleted = BTreeSet::new();
         for source_path in resolved {
-            let relative = match source_path.strip_prefix(&self.root) {
-                Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
+            let Some(relative) = source_path
+                .strip_prefix(&self.root)
+                .ok()
+                .and_then(relative_path_string)
+            else {
+                continue;
             };
+            // Filesystem records at or below the changed path; explicit overlays stay.
+            let prefix = format!("{relative}/");
             let tracked = current
                 .files
-                .keys()
-                .filter(|path| {
-                    *path == &relative
-                        || path.starts_with(&format!("{}/", relative.trim_end_matches('/')))
+                .iter()
+                .filter(|(path, record)| {
+                    record.source != FileSource::Explicit
+                        && (**path == relative || path.starts_with(&prefix))
                 })
-                .cloned()
+                .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>();
             let admitted = !has_symlink_component(&self.root, &source_path)
                 && source_path.is_file()
                 && !matcher.ignores(&relative, false);
-            if !admitted {
-                deleted.extend(
-                    tracked
-                        .into_iter()
-                        .filter(|path| current.files[path].source != FileSource::Explicit),
-                );
-                continue;
-            }
-            let metadata = match fs::metadata(&source_path) {
-                Ok(metadata) if metadata.len() <= self.file_source.max_file_size => metadata,
-                _ => {
-                    deleted.extend(tracked);
-                    continue;
-                }
+            let record = if admitted {
+                self.filesystem_record(&relative, &source_path, &current, generation)?
+            } else {
+                None
             };
-            let content = match self.file_source.read_within(&self.root, &source_path) {
-                Ok(content) => content,
-                Err(_) => {
-                    deleted.extend(tracked);
-                    continue;
+            match record {
+                Some(record) => {
+                    deleted.remove(&relative);
+                    records.push(record);
                 }
-            };
-            let metadata = fs::metadata(&source_path).unwrap_or(metadata);
-            let blob_name = calculate_blob_identity(&relative, &content)?;
-            if let Some(existing) = current.files.get(&relative)
-                && existing.source == FileSource::Explicit
-                && existing.status == FileStatus::Present
-                && existing.blob_name.as_deref() != Some(&blob_name)
-            {
-                records.push(existing.clone());
-                continue;
+                None => deleted.extend(tracked),
             }
-            records.push(FileRecord {
-                path: relative.clone(),
-                blob_name: Some(blob_name),
-                committed_blob_name: current
-                    .files
-                    .get(&relative)
-                    .and_then(|record| record.committed_blob_name.clone()),
-                status: FileStatus::Present,
-                content: Some(content),
-                size: metadata.len(),
-                modified_ns: metadata_modified_ns(&metadata),
-                source: FileSource::Filesystem,
-                generation,
-            });
-            deleted.remove(&relative);
         }
         self.state.apply_file_changes(
             &records,
@@ -381,26 +329,6 @@ impl WorkspaceContext {
 
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot, ContextError> {
         self.state.load_snapshot().map_err(Into::into)
-    }
-
-    fn plan_sync(&self) -> Result<SyncPlan, ContextError> {
-        let snapshot = self.snapshot()?;
-        let current = snapshot
-            .files
-            .values()
-            .filter(|record| record.status == FileStatus::Present)
-            .filter_map(|record| record.blob_name.clone())
-            .collect::<BTreeSet<_>>();
-        let committed = snapshot
-            .files
-            .values()
-            .filter_map(|record| record.committed_blob_name.clone())
-            .collect::<BTreeSet<_>>();
-        Ok(SyncPlan {
-            checkpoint_id: snapshot.checkpoint_id,
-            added_blobs: current.difference(&committed).cloned().collect(),
-            deleted_blobs: committed.difference(&current).cloned().collect(),
-        })
     }
 
     pub fn sync(&self) -> Result<SyncResult, ContextError> {
@@ -417,28 +345,49 @@ impl WorkspaceContext {
     }
 
     fn sync_reconciled(&self) -> Result<SyncResult, ContextError> {
-        let plan = self.plan_sync()?;
-        let records = self.state.load_records()?;
-        let current_records = records
-            .iter()
-            .filter(|record| record.status == FileStatus::Present)
+        let snapshot = self.snapshot()?;
+        let present = snapshot
+            .files
+            .values()
+            .filter(|record| record.status == FileStatus::Present);
+        let current_records = present
+            .clone()
             .filter_map(|record| record.blob_name.clone().map(|name| (name, record)))
             .collect::<BTreeMap<_, _>>();
         let current_names = current_records.keys().cloned().collect::<Vec<_>>();
-        let mut checkpoint_id = plan.checkpoint_id.clone();
-        if let Some(current) = checkpoint_id.as_deref() {
-            let status = self.api.blob_status(&[], Some(current))?;
-            if status.checkpoint_not_found {
-                checkpoint_id = None;
-            }
-        }
-        let names_to_check = if checkpoint_id.is_none() {
-            current_names.clone()
-        } else {
-            plan.added_blobs.clone()
-        };
-        let to_upload = self.find_missing(&names_to_check)?;
+        let committed = snapshot
+            .files
+            .values()
+            .filter_map(|record| record.committed_blob_name.clone())
+            .collect::<BTreeSet<_>>();
+        let added_blobs = current_names
+            .iter()
+            .filter(|name| !committed.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let deleted_blobs = committed
+            .iter()
+            .filter(|name| !current_records.contains_key(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
+        let mut checkpoint_id = snapshot.checkpoint_id.clone();
+        if let Some(current) = checkpoint_id.as_deref()
+            && self
+                .api
+                .blob_status(&[], Some(current))?
+                .checkpoint_not_found
+        {
+            checkpoint_id = None;
+        }
+        // Without a usable server checkpoint the whole inventory forms a fresh one.
+        let (mut checkpoint_added, mut checkpoint_deleted) = if checkpoint_id.is_none() {
+            (current_names.clone(), Vec::new())
+        } else {
+            (added_blobs, deleted_blobs.iter().cloned().collect())
+        };
+
+        let to_upload = self.find_missing(&checkpoint_added)?;
         let mut uploads = Vec::new();
         for name in &to_upload {
             let record = current_records
@@ -446,12 +395,13 @@ impl WorkspaceContext {
                 .ok_or_else(|| ContextError::MissingLocalBlob(name.clone()))?;
             let content = match self.state.load_file_content(&record.path)? {
                 Some(content) => content,
-                None => self
-                    .file_source
-                    .read_within(&self.root, &self.root.join(&record.path))?,
+                None => {
+                    self.file_source
+                        .read_within(&self.root, &self.root.join(&record.path))?
+                        .0
+                }
             };
-            let actual = calculate_blob_identity(&record.path, &content)?;
-            if &actual != name {
+            if calculate_blob_identity(&record.path, &content)? != *name {
                 return Err(ContextError::FileChanged(record.path.clone()));
             }
             uploads.push(BlobUpload {
@@ -466,8 +416,8 @@ impl WorkspaceContext {
         for upload in uploads {
             let upload_bytes = upload.path.len() + upload.content.len();
             if !batch.is_empty()
-                && (batch.len() >= self.max_upload_blobs
-                    || batch_bytes + upload_bytes > self.max_upload_bytes)
+                && (batch.len() >= MAX_UPLOAD_BLOBS
+                    || batch_bytes + upload_bytes > MAX_UPLOAD_BYTES)
             {
                 self.upload_batch(&batch, &mut uploaded)?;
                 batch.clear();
@@ -479,19 +429,9 @@ impl WorkspaceContext {
         if !batch.is_empty() {
             self.upload_batch(&batch, &mut uploaded)?;
         }
-        self.wait_ready(&to_upload.into_iter().collect::<Vec<_>>(), None)?;
+        self.wait_ready(&to_upload)?;
 
-        let mut checkpoint_added = if checkpoint_id.is_none() {
-            current_names.clone()
-        } else {
-            plan.added_blobs.clone()
-        };
-        let mut checkpoint_deleted = if checkpoint_id.is_none() {
-            Vec::new()
-        } else {
-            plan.deleted_blobs.clone()
-        };
-        if !checkpoint_added.is_empty() || !checkpoint_deleted.is_empty() || checkpoint_id.is_none()
+        if checkpoint_id.is_none() || !checkpoint_added.is_empty() || !checkpoint_deleted.is_empty()
         {
             match self.api.checkpoint(
                 checkpoint_id.as_deref(),
@@ -513,21 +453,20 @@ impl WorkspaceContext {
             }
         }
         let checkpoint_id = checkpoint_id.ok_or(ContextError::MissingCheckpoint)?;
-        let deleted_names = plan.deleted_blobs.iter().cloned().collect::<BTreeSet<_>>();
-        let deleted_paths = records
-            .iter()
+        let deleted_paths = snapshot
+            .files
+            .values()
             .filter(|record| record.status != FileStatus::Present)
             .filter(|record| {
                 record
                     .committed_blob_name
                     .as_ref()
-                    .is_some_and(|name| deleted_names.contains(name))
+                    .is_some_and(|name| deleted_blobs.contains(name))
             })
             .map(|record| record.path.clone())
             .collect::<Vec<_>>();
-        let generation = self.snapshot()?.generation;
         self.state
-            .commit_sync(&checkpoint_id, &deleted_paths, generation)?;
+            .commit_sync(&checkpoint_id, &deleted_paths, snapshot.generation)?;
         Ok(SyncResult {
             uploaded_blob_names: uploaded.into_iter().collect(),
             checkpoint_id: Some(checkpoint_id),
@@ -538,7 +477,7 @@ impl WorkspaceContext {
 
     fn find_missing(&self, names: &[String]) -> Result<BTreeSet<String>, ContextError> {
         let mut missing_names = BTreeSet::new();
-        for batch in names.chunks(self.max_find_missing) {
+        for batch in names.chunks(MAX_FIND_MISSING) {
             let missing = self.api.find_missing(batch)?;
             missing_names.extend(missing.unknown_blob_names);
             missing_names.extend(missing.nonindexed_blob_names);
@@ -570,19 +509,13 @@ impl WorkspaceContext {
         Ok(())
     }
 
-    fn wait_ready(
-        &self,
-        names: &[String],
-        checkpoint_id: Option<&str>,
-    ) -> Result<(), ContextError> {
+    fn wait_ready(&self, names: &BTreeSet<String>) -> Result<(), ContextError> {
         if names.is_empty() {
             return Ok(());
         }
-        let mut pending = names.iter().cloned().collect::<BTreeSet<_>>();
-        for attempt in 0..self.ready_poll_attempts {
-            let status = self
-                .api
-                .blob_status(&pending.iter().cloned().collect::<Vec<_>>(), checkpoint_id)?;
+        let mut pending = names.iter().cloned().collect::<Vec<_>>();
+        for attempt in 0..READY_POLL_ATTEMPTS {
+            let status = self.api.blob_status(&pending, None)?;
             if status.checkpoint_not_found {
                 return Err(ContextError::CheckpointResetRequired(
                     "server checkpoint no longer exists".to_owned(),
@@ -591,21 +524,18 @@ impl WorkspaceContext {
             if !status.unknown_blob_names.is_empty() {
                 return Err(ContextError::UnknownBlobs(status.unknown_blob_names));
             }
-            pending = status.nonindexed_blob_names.into_iter().collect();
+            pending = status.nonindexed_blob_names;
             if pending.is_empty() {
                 return Ok(());
             }
-            if attempt + 1 < self.ready_poll_attempts {
-                thread::sleep(self.ready_poll_interval);
+            if attempt + 1 < READY_POLL_ATTEMPTS {
+                thread::sleep(READY_POLL_INTERVAL);
             }
         }
-        Err(ContextError::ReadyTimeout(pending.into_iter().collect()))
+        Err(ContextError::ReadyTimeout(pending))
     }
 
-    pub fn retrieve(&self, query: &str, scope: &str) -> Result<RetrievalResult, ContextError> {
-        if !matches!(scope, "workspace" | "working_set") {
-            return Err(ContextError::InvalidScope(scope.to_owned()));
-        }
+    pub fn retrieve(&self, query: &str) -> Result<RetrievalResult, ContextError> {
         let snapshot = self.snapshot()?;
         if snapshot.synced_generation != Some(snapshot.generation) {
             self.sync()?;
@@ -642,50 +572,6 @@ impl WorkspaceContext {
     }
 }
 
-fn normalize_absolute(path: &Path) -> Result<PathBuf, ContextError> {
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(canonical);
-    }
-    normalize_lexical_absolute(path)
-}
-
-fn normalize_lexical_absolute(path: &Path) -> Result<PathBuf, ContextError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(ContextError::InvalidRelativePath(path.to_path_buf()));
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalize_lexical_relative(path: &Path) -> Result<PathBuf, ContextError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(ContextError::InvalidRelativePath(path.to_path_buf()));
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(ContextError::InvalidRelativePath(path.to_path_buf()));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
 fn has_symlink_component(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
@@ -701,15 +587,6 @@ fn has_symlink_component(root: &Path, path: &Path) -> bool {
         }
     }
     false
-}
-
-fn metadata_modified_ns(metadata: &fs::Metadata) -> Option<i64> {
-    let duration = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    i64::try_from(duration.as_nanos()).ok()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -746,8 +623,6 @@ pub enum ContextError {
     CheckpointResetRequired(String),
     #[error("server did not return a checkpoint")]
     MissingCheckpoint,
-    #[error("unknown scope: {0}")]
-    InvalidScope(String),
     #[error(transparent)]
     Api(#[from] ApiError),
     #[error(transparent)]

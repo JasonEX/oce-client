@@ -5,7 +5,6 @@ description = "Development-only benchmark tooling for the Rust oce-client"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.25.0",
-    "pathspec>=0.12.1",
 ]
 
 [project.urls]

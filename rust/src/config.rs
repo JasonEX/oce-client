@@ -3,13 +3,14 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
 use crate::context::{ContextError, WorkspaceContext};
 use crate::http::OceHttpClient;
+use crate::identity::sha256_hex;
 
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8986";
 pub const DEFAULT_API_KEY: &str = "sk-opencontextengine";
+pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
+pub const DEFAULT_READY_TIMEOUT_SECONDS: f64 = 3.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSettings {
@@ -31,35 +32,12 @@ impl ClientSettings {
         let root = root
             .or_else(|| nonempty_env("OCE_WORKSPACE").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("."));
-        let root = canonical_or_absolute(&root)?;
-        let api_url = api_url
-            .or_else(|| nonempty_env("OCE_API_URL"))
-            .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
-        let api_url = api_url.trim().trim_end_matches('/').to_owned();
-        if api_url.is_empty() {
-            return Err(ConfigurationError::Invalid(
-                "OCE API URL must not be empty".to_owned(),
-            ));
-        }
-        let api_key = env::var("OCE_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_owned());
-        if require_api_key && api_key.is_empty() {
-            return Err(ConfigurationError::Invalid(
-                "OCE API key is required; set OCE_API_KEY".to_owned(),
-            ));
-        }
-        let state_path = state_path
-            .or_else(|| nonempty_env("OCE_STATE_PATH").map(PathBuf::from))
-            .map(|path| canonical_parent_join(&path))
-            .transpose()?;
-        let runtime_patterns = runtime_patterns.unwrap_or_else(|| {
-            split_runtime_patterns(env::var("OCE_IGNORE").unwrap_or_default().as_str())
-        });
         Ok(Self {
-            root,
-            api_url,
-            api_key,
-            state_path,
-            runtime_patterns,
+            root: canonical_or_absolute(&root)?,
+            api_url: resolve_api_url(api_url)?,
+            api_key: resolve_api_key(require_api_key)?,
+            state_path: resolve_state_path(state_path)?,
+            runtime_patterns: resolve_runtime_patterns(runtime_patterns),
         })
     }
 
@@ -98,6 +76,19 @@ impl InitialSync {
     }
 }
 
+/// Explicit MCP settings; `None` fields fall back to environment variables and defaults.
+#[derive(Debug, Clone, Default)]
+pub struct McpOptions {
+    pub workspace_roots: Option<Vec<PathBuf>>,
+    pub api_url: Option<String>,
+    pub state_path: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+    pub runtime_patterns: Option<Vec<String>>,
+    pub debounce_ms: Option<i64>,
+    pub initial_sync: Option<String>,
+    pub ready_timeout_seconds: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct McpConfiguration {
     pub workspaces: Vec<ClientSettings>,
@@ -107,29 +98,16 @@ pub struct McpConfiguration {
 }
 
 impl McpConfiguration {
-    #[allow(clippy::too_many_arguments)]
-    pub fn resolve(
-        workspace_roots: Option<Vec<PathBuf>>,
-        api_url: Option<String>,
-        state_path: Option<PathBuf>,
-        state_dir: Option<PathBuf>,
-        runtime_patterns: Option<Vec<String>>,
-        debounce_ms: Option<i64>,
-        initial_sync: Option<String>,
-        ready_timeout_seconds: Option<f64>,
-    ) -> Result<Self, ConfigurationError> {
-        let roots = match workspace_roots {
+    pub fn resolve(options: McpOptions) -> Result<Self, ConfigurationError> {
+        let roots = match options.workspace_roots {
             Some(values) => values,
-            None => {
-                if let Some(paths) = env::var_os("OCE_WORKSPACES") {
-                    env::split_paths(&paths).collect()
-                } else {
-                    nonempty_env("OCE_WORKSPACE")
-                        .map(PathBuf::from)
-                        .into_iter()
-                        .collect()
-                }
-            }
+            None => match env::var_os("OCE_WORKSPACES") {
+                Some(paths) => env::split_paths(&paths).collect(),
+                None => nonempty_env("OCE_WORKSPACE")
+                    .map(PathBuf::from)
+                    .into_iter()
+                    .collect(),
+            },
         };
         let mut canonical_roots = Vec::new();
         for root in roots {
@@ -145,11 +123,9 @@ impl McpConfiguration {
             ));
         }
 
-        let state_path = state_path
-            .or_else(|| nonempty_env("OCE_STATE_PATH").map(PathBuf::from))
-            .map(|path| canonical_parent_join(&path))
-            .transpose()?;
-        let state_dir = state_dir
+        let state_path = resolve_state_path(options.state_path)?;
+        let state_dir = options
+            .state_dir
             .or_else(|| nonempty_env("OCE_STATE_DIR").map(PathBuf::from))
             .map(|path| canonical_parent_join(&path))
             .transpose()?;
@@ -165,43 +141,41 @@ impl McpConfiguration {
                     .to_owned(),
             ));
         }
-        let patterns = runtime_patterns.unwrap_or_else(|| {
-            split_runtime_patterns(env::var("OCE_IGNORE").unwrap_or_default().as_str())
-        });
-        let mut workspaces = Vec::new();
-        for (index, root) in canonical_roots.into_iter().enumerate() {
-            let selected_state = if let Some(directory) = state_dir.as_ref() {
-                Some(directory.join(workspace_state_name(&root)))
-            } else if index == 0 {
-                state_path.clone()
-            } else {
-                None
-            };
-            workspaces.push(ClientSettings::resolve(
-                Some(root),
-                api_url.clone(),
-                selected_state,
-                Some(patterns.clone()),
-                true,
-            )?);
-        }
+        let api_url = resolve_api_url(options.api_url)?;
+        let api_key = resolve_api_key(true)?;
+        let runtime_patterns = resolve_runtime_patterns(options.runtime_patterns);
+        let workspaces = canonical_roots
+            .into_iter()
+            .enumerate()
+            .map(|(index, root)| ClientSettings {
+                state_path: match &state_dir {
+                    Some(directory) => Some(directory.join(workspace_state_name(&root))),
+                    None if index == 0 => state_path.clone(),
+                    None => None,
+                },
+                root,
+                api_url: api_url.clone(),
+                api_key: api_key.clone(),
+                runtime_patterns: runtime_patterns.clone(),
+            })
+            .collect();
 
-        let debounce_ms = match debounce_ms {
+        let debounce_ms = match options.debounce_ms {
             Some(value) => value,
-            None => parse_env::<i64>("OCE_DEBOUNCE_MS")?.unwrap_or(500),
+            None => parse_env::<i64>("OCE_DEBOUNCE_MS")?
+                .unwrap_or(i64::try_from(DEFAULT_DEBOUNCE_MS).expect("default fits i64")),
         };
-        if debounce_ms < 0 {
-            return Err(ConfigurationError::Invalid(
-                "debounce-ms must not be negative".to_owned(),
-            ));
-        }
-        let initial_sync_value = initial_sync
+        let debounce_ms = u64::try_from(debounce_ms).map_err(|_| {
+            ConfigurationError::Invalid("debounce-ms must not be negative".to_owned())
+        })?;
+        let initial_sync_value = options
+            .initial_sync
             .or_else(|| nonempty_env("OCE_INITIAL_SYNC"))
             .unwrap_or_else(|| "background".to_owned());
         let initial_sync = InitialSync::parse(&initial_sync_value)?;
-        let ready_timeout_seconds = match ready_timeout_seconds {
+        let ready_timeout_seconds = match options.ready_timeout_seconds {
             Some(value) => value,
-            None => parse_env::<f64>("OCE_READY_TIMEOUT")?.unwrap_or(3.0),
+            None => parse_env::<f64>("OCE_READY_TIMEOUT")?.unwrap_or(DEFAULT_READY_TIMEOUT_SECONDS),
         };
         if ready_timeout_seconds < 0.0 || !ready_timeout_seconds.is_finite() {
             return Err(ConfigurationError::Invalid(
@@ -210,7 +184,7 @@ impl McpConfiguration {
         }
         Ok(Self {
             workspaces,
-            debounce_ms: u64::try_from(debounce_ms).expect("non-negative debounce"),
+            debounce_ms,
             initial_sync,
             ready_timeout_seconds,
         })
@@ -228,15 +202,44 @@ pub fn split_runtime_patterns(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn resolve_api_url(api_url: Option<String>) -> Result<String, ConfigurationError> {
+    let api_url = api_url
+        .or_else(|| nonempty_env("OCE_API_URL"))
+        .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+    let api_url = api_url.trim().trim_end_matches('/').to_owned();
+    if api_url.is_empty() {
+        return Err(ConfigurationError::Invalid(
+            "OCE API URL must not be empty".to_owned(),
+        ));
+    }
+    Ok(api_url)
+}
+
+fn resolve_api_key(required: bool) -> Result<String, ConfigurationError> {
+    let api_key = env::var("OCE_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_owned());
+    if required && api_key.is_empty() {
+        return Err(ConfigurationError::Invalid(
+            "OCE API key is required; set OCE_API_KEY".to_owned(),
+        ));
+    }
+    Ok(api_key)
+}
+
+fn resolve_state_path(state_path: Option<PathBuf>) -> Result<Option<PathBuf>, ConfigurationError> {
+    state_path
+        .or_else(|| nonempty_env("OCE_STATE_PATH").map(PathBuf::from))
+        .map(|path| canonical_parent_join(&path))
+        .transpose()
+}
+
+fn resolve_runtime_patterns(runtime_patterns: Option<Vec<String>>) -> Vec<String> {
+    runtime_patterns.unwrap_or_else(|| {
+        split_runtime_patterns(env::var("OCE_IGNORE").unwrap_or_default().as_str())
+    })
+}
+
 fn workspace_state_name(root: &Path) -> String {
-    let identity = normalized_workspace_identity(root);
-    let mut digest = Sha256::new();
-    digest.update(identity.as_bytes());
-    let encoded = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let encoded = sha256_hex(&[normalized_workspace_identity(root).as_bytes()]);
     format!("{}.sqlite3", &encoded[..16])
 }
 
@@ -250,33 +253,25 @@ fn normalized_workspace_identity(root: &Path) -> String {
     root.to_string_lossy().into_owned()
 }
 
+/// Canonicalizes an existing path, or makes a missing one absolute against the current
+/// directory.
 pub(crate) fn canonical_or_absolute(path: &Path) -> Result<PathBuf, ConfigurationError> {
     let path = expand_home(path)?;
     if let Ok(canonical) = path.canonicalize() {
         return Ok(canonical);
     }
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        env::current_dir()
-            .map_err(ConfigurationError::CurrentDirectory)?
-            .join(&path)
-    };
-    Ok(absolute)
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(env::current_dir()
+        .map_err(ConfigurationError::CurrentDirectory)?
+        .join(path))
 }
 
+/// Like `canonical_or_absolute`, but also canonicalizes the parent of a path that does not
+/// exist yet, so state files land next to their real directory.
 fn canonical_parent_join(path: &Path) -> Result<PathBuf, ConfigurationError> {
-    let path = expand_home(path)?;
-    if let Ok(canonical) = path.canonicalize() {
-        return Ok(canonical);
-    }
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        env::current_dir()
-            .map_err(ConfigurationError::CurrentDirectory)?
-            .join(&path)
-    };
+    let absolute = canonical_or_absolute(path)?;
     if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
         && let Ok(parent) = parent.canonicalize()
     {
@@ -300,7 +295,7 @@ fn expand_home(path: &Path) -> Result<PathBuf, ConfigurationError> {
     }))
 }
 
-fn user_home() -> Option<PathBuf> {
+pub(crate) fn user_home() -> Option<PathBuf> {
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
