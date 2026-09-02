@@ -1,6 +1,6 @@
 [package]
 name = "oce-client"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Standalone workspace synchronization and MCP client for OpenContextEngine"

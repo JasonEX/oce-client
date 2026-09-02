@@ -5,6 +5,13 @@ Entries are generated from Conventional Commits.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-02
+
+### Changed
+
+- avoid redundant reconcile work
+- make the Rust client the single source of truth
+
 ## [0.1.2] - 2026-09-02
 
 ### Fixed
